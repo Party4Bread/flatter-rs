@@ -21,6 +21,7 @@
 pub mod gemm_f64;
 pub mod gemm_i64;
 pub mod lattice;
+pub mod math;
 pub mod profile;
 pub mod reduction;
 pub mod tri_matmul_mpfr;

@@ -98,43 +98,61 @@ guarantees).
 * Profile computation (`get_drop`, `get_spread`) ported from
   `src/profile.cpp`.
 
-**Not ported — the `RecursiveGeneric` core**: flatter's actual named
-contribution is the iterated-compression heuristic in
-`src/problems/lattice_reduction/recursive_generic.cpp` (and its
-Heuristic2/Heuristic3/Threaded3 subclasses). The trick:
+**Building blocks of the recursive core — ported and unit-tested**:
 
- 1. QR-factor the integer basis `B` into `Q · R` at MPFR precision.
- 2. Shift `R`'s columns to bring them into a fixed-precision window
-    (`compress_R` in recursive_generic.cpp:378).
- 3. Recursively reduce that **compressed shadow** at low precision.
- 4. Lift the resulting unimodular `U` back to the exact basis by a
-    big-integer matmul: `B := B · U`.
- 5. Repeat until the profile is reduced.
+* `src/math/qr.rs` — Householder QR in MPFR (port of
+  `householder_mpfr.cpp`'s `larfg`/`larf`, without the block-reflector
+  optimization).
+* `src/math/size_reduce_r.rs` — size reduction given an integer basis
+  B and its MPFR R factor. Guarantees `|R[i,j]| ≤ |R[i,i]|/2` for all
+  `i < j` after the call.
+* `src/math/mat_mpfr.rs` — dense MPFR matrix with the minimal surface
+  QR + size-reduce-R need.
 
-The key property is that each recursive call runs on O(n) basis
-vectors with O(precision)-bit entries, regardless of how large the
-*original* entries were. Classical LLL in MPFR has to keep full
-precision throughout, which is why we see the `n·b` vs `n³·b` gap in
-the table's bottom-right cells.
+Tests confirm QR diagonals equal Gram-Schmidt norms, and size-reduce
+preserves the basis determinant while bounding off-diagonals of R.
 
-Porting the recursive core is a bounded amount of work but not a
-one-liner:
+**Not yet wired into dispatch — the recursive sublattice split**:
 
-* `QRFactorization` in MPFR — a Householder variant already lives in
-  `src/problems/qr_factorization/householder_mpfr.cpp` (~400 LOC). `rug`
-  makes the port mechanical.
-* `FusedQRSizeReduction` — inner loop in
-  `src/problems/fused_qr_sizered/columnwise_double.cpp` (~500 LOC).
-* `RecursiveGeneric::solve` + Heuristic2/3's `setup_sublattice_reductions`
-  — ~1200 LOC total across the three files.
-* `SublatticeSplit` — trivial.
+Flatter's `RecursiveGeneric::solve` (`src/problems/lattice_reduction/recursive_generic.cpp:409`)
+runs the loop:
 
-Between 2000 – 3000 LOC including tests. One focused session on top of
-what's here.
+ 1. QR-factor B → R (ported above).
+ 2. Size-reduce R (ported above).
+ 3. Compress R into a low-precision shadow. The shift formula
+    (`get_shifts_for_compression` at recursive_generic.cpp:333)
+    tracks the profile's *staircase* structure so that for q-ary
+    inputs (first-half diagonals ≫ second-half diagonals) the shifts
+    stay safe per column.
+ 4. Recurse on the shadow via `LatticeReduction::solve` on a
+    sublattice window picked by `SublatticeSplit`.
+ 5. Lift U back with a big-integer matmul.
+ 6. Repeat.
+
+A prototype in `src/reduction/heuristic.rs` implements steps 1–3 and
+5 but with a *non-recursive* shadow LLL, which isn't enough for q-ary
+inputs: the compression keeps the precision the same (profile spread
+is unchanged), so the shadow LLL isn't any cheaper than the original.
+The recursive sublattice split is what actually halves precision per
+level — that's the missing piece.
+
+Remaining work (rough LOC):
+
+* `SublatticeSplit::get_sublattices` / `get_child_split` — ~150 LOC,
+  mechanical.
+* `Heuristic2::setup_sublattice_reductions` — ~150 LOC. Uses
+  `SublatticeSplit` to pick `[start..end]`, builds a sub-`Lattice`,
+  calls `reduce` recursively, collects U.
+* `Heuristic2::reduce_sublattices` / `update_representation` — ~200
+  LOC. Wires the recursion into the main loop, with matmul to apply
+  U to the global R and B.
+* End-to-end wiring and tests — ~200 LOC.
+
+~700 LOC total; one more focused session on top of what ships here.
 
 The gemm kernels already ported (`src/gemm_f64.rs`, `src/gemm_i64.rs`,
-`src/tri_matmul_mpfr.rs`) are the multiplication primitives this layer
-would call.
+`src/tri_matmul_mpfr.rs`) cover the multiplication primitives this
+layer needs.
 
 Sketch of what's needed:
 * `MatrixData<mpfr_t>` / `MatrixData<mpz_t>` wrappers (we have the int

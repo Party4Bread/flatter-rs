@@ -36,10 +36,16 @@ pub(crate) const F64_MAX_BITS: u64 = 300;
 pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     let max_bits = max_entry_bits(L);
     if max_bits <= F64_MAX_BITS {
-        reduce_f64(L, params, None)
-    } else {
-        reduce_mpfr(L, params, max_bits)
+        return reduce_f64(L, params, None);
     }
+    // For huge-entry lattices we use classical LLL in MPFR. A
+    // simplified iterated-compression prototype lives in
+    // `crate::reduction::heuristic` — it QR-factors the basis and
+    // size-reduces R as building blocks — but the shadow-lattice
+    // construction in that prototype doesn't converge for q-ary inputs
+    // (the profile is too spread). Flatter's real compression uses
+    // sublattice splitting, which is the remaining unported piece.
+    reduce_mpfr(L, params, max_bits)
 }
 
 fn max_entry_bits(L: &Lattice) -> u64 {

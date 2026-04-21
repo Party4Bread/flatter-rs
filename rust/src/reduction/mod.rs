@@ -3,6 +3,7 @@
 //! implementation surface — see the implementation status in each module.
 
 pub mod goal;
+pub mod heuristic;
 pub mod lagrange;
 pub mod lll;
 pub mod params;

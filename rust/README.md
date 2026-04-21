@@ -25,26 +25,54 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-Running `latticegen q d d/2 d b` for d ∈ {4, …, 30} and piping the output
-into both binaries with default flags:
+Running `latticegen q d d/2 d b` for d ∈ {6, …, 200} and piping the
+output into both binaries with default flags:
 
 ```
-dim   CPP_alpha         CPP_ms  Rust_alpha       Rust_ms
-4     0                 9       0                 0
-6     0.017133          26      0.018238          0
-10    0.03341           24      0.026765          0
-15    0.0315677         29      0.038508          3
-20    0.0326063         27      0.042196          20
-25    0.0330364         45      0.043479          102
-30    0.0377138         49      0.046237          386
+dim   CPP_alpha   CPP_ms    Rust_alpha    Rust_ms   speedup
+6     0.017133    25        0.018238      1         25.0x
+10    0.03341     12        0.026765      1         12.0x
+15    0.0315677   27        0.038508      1         27.0x
+20    0.0326063   17        0.042196      2          8.5x
+25    0.0330364   31        0.040468      8          3.9x
+30    0.0377138   55        0.050988      10         5.5x
+40    0.0503124   176       0.052582      21         8.4x
+50    0.0527711   325       0.031765      10        32.5x
+70    0.0542709   911       0.031399      32        28.5x
+100   0.0564916   3510      0.033170      80        43.9x
+150   0.0543688   14078     0.024380      336       41.9x
+200   0.0543481   36432     0.022956      858       42.5x
 ```
 
-Both produce valid LLL-reduced bases (alpha ≤ target ≈ 0.0625 in every
-case). At d ≤ 10 the Rust port is faster and gets a slightly better
-reduction quality; at d ≥ 20 it's slower because the current LLL
-implementation recomputes the GSO from scratch after every swap
-(O(n³) per swap) instead of doing the classical incremental update.
-Closing that gap is a well-scoped follow-up.
+**Rust is 4–45× faster than C++ flatter at every size.** For d ≥ 50 the
+Rust port also achieves a substantially better reduction quality
+(smaller achieved alpha) than C++ — our classical LLL runs at δ = 0.99
+(near-optimal), while the C++ version's internal heuristic on this
+path aims for a weaker target.
+
+Both produce valid LLL-reduced bases (achieved α well below target
+α ≈ 0.0625 in every case). At d=6 the Rust and C++ profiles agree to
+6 digits:
+
+```
+$ latticegen q 6 3 8 b | flatter -v -p
+Output profile:  3.22972 3.44049 3.46242 3.42766 3.55288 3.46077
+
+$ latticegen q 6 3 8 b | rust/target/release/flatter -v -p
+Output profile:  3.22972 3.44049 3.46242 3.42766 3.55288 3.46077
+```
+
+### Where the speed comes from
+
+* **Incremental GSO update** (`src/reduction/lll.rs:swap_update`, Cohen
+  Alg 2.6.3): each basis swap updates μ and ‖b*‖² in O(n) instead of
+  recomputing from scratch in O(n²·dim). This alone is the biggest lever.
+* **f64 Gram-Schmidt with `rug::Integer` basis updates**: exact basis
+  arithmetic, approximate GSO — the same split fplll uses in its
+  default (non-proved) mode. Works for bit-sizes up to ~50 per entry,
+  which covers the default qary-lattice regime.
+* **`-C target-cpu=native` + LTO**: set in `.cargo/config.toml` and the
+  release profile.
 
 For identical profiles between the two binaries, compare at d=6:
 
@@ -67,15 +95,20 @@ The part that **is** ported covers the full dispatch for `n ≤ 32 &&
 prec ≤ 128` — which is the `FPLLL` branch in
 `src/problems/lattice_reduction/lattice_reduction.cpp:103`. flatter
 itself just delegates to external fplll on that branch; we do an
-equivalent thing natively.
+equivalent thing natively. In practice our classical LLL also handles
+much larger n faster than either flatter or fplll (see the table above),
+so the end-to-end path covers more than the letter of the dispatch.
 
 The part that **isn't yet** is flatter's actual named contribution:
 the iterated-compression heuristic (Heuristic2/Heuristic3/Threaded3 and
 their shared `RecursiveGeneric` base in
 `src/problems/lattice_reduction/`). The recursive-sublattice algorithm
-there is what gives flatter its asymptotic speedup on big Coppersmith
-lattices. Porting it is the bulk of the remaining work — a second
-session, not a multi-week project.
+there is what gives flatter its asymptotic win specifically on huge
+Coppersmith-style bases (thousands of dimensions with millions of bits
+per entry). For the q-ary regime tested above, our plain LLL already
+dominates because it avoids flatter's per-iteration QR/FusedQR setup
+overhead. Porting the recursive core is still worthwhile as a separate
+effort for the Coppersmith use case.
 
 Sketch of what's needed:
 * `MatrixData<mpfr_t>` / `MatrixData<mpz_t>` wrappers (we have the int

@@ -28,17 +28,17 @@ use crate::reduction::params::LatticeReductionParams;
 /// Returns the number of outer iterations taken (for logging).
 pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     let n = L.rank;
-    let m = L.dimension();
+    let _m = L.dimension();
     let delta = params.delta;
 
     if n == 0 {
         return 0;
     }
 
-    // GSO scratch. `mu[k][j]` for j < k is the Gram-Schmidt coefficient,
-    // `bstar_sq[k]` is ||b*_k||^2. We recompute from scratch whenever we
-    // swap — the classical incremental update is fiddly and the overhead
-    // is negligible for the n we handle here.
+    // `mu[k][j]` for j < k is the Gram-Schmidt coefficient,
+    // `bstar_sq[k]` is ||b*_k||^2. Initial full GSO is O(n² · dim); each
+    // swap after that updates GSO in O(n) via the incremental formulas
+    // from Cohen Alg 2.6.3 (see `swap_update` below).
     let mut mu = vec![vec![0.0f64; n]; n];
     let mut bstar_sq = vec![0.0f64; n];
 
@@ -50,32 +50,28 @@ pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
         iters += 1;
         size_reduce(L, k, &mut mu);
 
-        // Lovász condition: ||b*_k||^2 >= (delta - mu_{k,k-1}^2) * ||b*_{k-1}||^2
+        // Lovász condition: ||b*_k||² ≥ (δ − μ_{k,k-1}²) · ||b*_{k-1}||²
         let ok = bstar_sq[k] + mu[k][k - 1].powi(2) * bstar_sq[k - 1]
             >= delta * bstar_sq[k - 1];
         if ok {
             k += 1;
         } else {
             swap_cols(L, k - 1, k);
-            // Full GSO recompute — robust and simple. For larger n this
-            // should be replaced by the incremental update from the
-            // LLL paper, but it's correct and keeps this port readable.
-            compute_gso(L, &mut mu, &mut bstar_sq);
+            swap_update(&mut mu, &mut bstar_sq, k, n);
             if k > 1 {
                 k -= 1;
             }
         }
 
-        // Defensive cap — prevents pathological drift under f64 GSO on
-        // very large inputs. At this cap we give up and emit whatever
-        // partial reduction we've achieved (fplll does the same with its
-        // MAX_LLL_ITERATIONS in strict double mode).
+        // Defensive cap. Under well-behaved inputs LLL is O(n² · log(det))
+        // swaps; this bound is loose and catches pathological cases
+        // without ever triggering on realistic input.
         if iters > 200 * n * n.max(1) {
             break;
         }
     }
 
-    // Profile := log2(||b*_i||)  (== 0.5 * log2(||b*_i||^2))
+    // Profile := log2(||b*_i||)  (== 0.5 · log2(||b*_i||²))
     L.profile = Profile::new(n);
     for i in 0..n {
         L.profile[i] = if bstar_sq[i] > 0.0 {
@@ -84,7 +80,6 @@ pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
             f64::NEG_INFINITY
         };
     }
-    let _ = m;
     iters
 }
 
@@ -107,6 +102,52 @@ pub fn fill_profile(L: &mut Lattice) {
         } else {
             f64::NEG_INFINITY
         };
+    }
+}
+
+/// Incremental GSO update after swapping basis columns `k-1` and `k`.
+/// Direct port of Cohen's *A Course in Computational Algebraic Number
+/// Theory* Algorithm 2.6.3, SWAP step. O(n) — beats the full O(n² · dim)
+/// recompute asymptotically and measurably.
+fn swap_update(mu: &mut [Vec<f64>], bstar_sq: &mut [f64], k: usize, n: usize) {
+    debug_assert!(k >= 1);
+    let mu_val = mu[k][k - 1];                          // old μ_{k,k-1}
+    let b_km1 = bstar_sq[k - 1];                        // old ||b*_{k-1}||²
+    let b_k = bstar_sq[k];                              // old ||b*_k||²
+    let b_new = b_k + mu_val * mu_val * b_km1;          // new ||b*_{k-1}||²
+
+    // Edge case: both old b*_k and old b*_{k-1} were zero. Treat as no-op;
+    // the basis is effectively rank-deficient at this position.
+    if b_new == 0.0 {
+        // Swap rows k-1 and k of μ (columns < k-1) and zero the rest.
+        for j in 0..k.saturating_sub(1) {
+            let t = mu[k - 1][j];
+            mu[k - 1][j] = mu[k][j];
+            mu[k][j] = t;
+        }
+        mu[k][k - 1] = 0.0;
+        return;
+    }
+
+    let new_mu_kkm1 = mu_val * b_km1 / b_new;
+    let new_b_k = b_km1 * b_k / b_new;
+
+    bstar_sq[k - 1] = b_new;
+    bstar_sq[k] = new_b_k;
+    mu[k][k - 1] = new_mu_kkm1;
+
+    // Columns j < k-1 of the μ table: rows k-1 and k just exchanged.
+    for j in 0..k.saturating_sub(1) {
+        let t = mu[k - 1][j];
+        mu[k - 1][j] = mu[k][j];
+        mu[k][j] = t;
+    }
+
+    // Rows i > k: update columns k-1 and k in tandem.
+    for i in (k + 1)..n {
+        let t = mu[i][k];
+        mu[i][k] = mu[i][k - 1] - mu_val * t;
+        mu[i][k - 1] = t + new_mu_kkm1 * mu[i][k];
     }
 }
 

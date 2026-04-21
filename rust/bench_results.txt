@@ -1,0 +1,71 @@
+=== Building C++ baseline ===
+=== Building Rust port ===
+
+################ C++ baseline ################
+flatter C++ baseline gemm bench
+kernel                              best ms        GFLOP/GIOP s
+
+== f64 gemm  m=128 n=128 k=128  (4.2 Mflop) ==
+C++ flatter ijk (1 thread)            2.158 ms        1.944 G/s
+C++ ikj autovec (1 thread)            0.587 ms        7.150 G/s
+
+== f64 gemm  m=256 n=256 k=256  (33.6 Mflop) ==
+C++ flatter ijk (1 thread)           16.547 ms        2.028 G/s
+C++ ikj autovec (1 thread)            4.275 ms        7.849 G/s
+
+== f64 gemm  m=512 n=512 k=512  (268.4 Mflop) ==
+C++ flatter ijk (1 thread)          skipped        too slow
+C++ ikj autovec (1 thread)           45.401 ms        5.913 G/s
+
+== i64 gemm  m=128 n=128 k=128  (4.2 Miop) ==
+C++ flatter ijk (1 thread)            2.199 ms        1.907 G/s
+C++ ikj autovec (1 thread)            0.475 ms        8.823 G/s
+
+== i64 gemm  m=256 n=256 k=256  (33.6 Miop) ==
+C++ flatter ijk (1 thread)           16.636 ms        2.017 G/s
+C++ ikj autovec (1 thread)            3.393 ms        9.889 G/s
+
+== i64 gemm  m=512 n=512 k=512  (268.4 Miop) ==
+C++ flatter ijk (1 thread)          skipped        too slow
+C++ ikj autovec (1 thread)           36.564 ms        7.342 G/s
+
+################ Rust port ###################
+flatter-rs gemm bench   (rayon threads = 4)
+kernel                              best ms        GFLOP/GIOP s
+------------------------------------------------------------------
+
+== f64 gemm  m=128 n=128 k=128  (4.2 Mflop) ==
+naive (C++-port triple loop)          2.030 ms        2.067 G/s
+blocked  (1 thread)                   0.384 ms       10.910 G/s
+blocked  + rayon                      0.326 ms       12.872 G/s
+avx2+fma (1 thread)                   0.502 ms        8.363 G/s
+avx2+fma + rayon                      0.368 ms       11.384 G/s
+
+== f64 gemm  m=256 n=256 k=256  (33.6 Mflop) ==
+naive (C++-port triple loop)         14.776 ms        2.271 G/s
+blocked  (1 thread)                   3.120 ms       10.756 G/s
+blocked  + rayon                      1.378 ms       24.344 G/s
+avx2+fma (1 thread)                   3.867 ms        8.678 G/s
+avx2+fma + rayon                      1.319 ms       25.437 G/s
+
+== f64 gemm  m=512 n=512 k=512  (268.4 Mflop) ==
+naive (C++-port triple loop)        skipped        too slow
+blocked  (1 thread)                  29.987 ms        8.952 G/s
+blocked  + rayon                      8.556 ms       31.374 G/s
+avx2+fma (1 thread)                  37.056 ms        7.244 G/s
+avx2+fma + rayon                     12.718 ms       21.107 G/s
+
+== i64 gemm  m=128 n=128 k=128  (4.2 Miop) ==
+naive (C++-port triple loop)          2.292 ms        1.830 G/s
+blocked  (1 thread)                   0.634 ms        6.618 G/s
+blocked  + rayon                      0.433 ms        9.683 G/s
+
+== i64 gemm  m=256 n=256 k=256  (33.6 Miop) ==
+naive (C++-port triple loop)         15.624 ms        2.148 G/s
+blocked  (1 thread)                   4.023 ms        8.341 G/s
+blocked  + rayon                      1.248 ms       26.886 G/s
+
+== i64 gemm  m=512 n=512 k=512  (268.4 Miop) ==
+naive (C++-port triple loop)        skipped        too slow
+blocked  (1 thread)                  34.382 ms        7.807 G/s
+blocked  + rayon                      9.650 ms       27.818 G/s

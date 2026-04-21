@@ -1,0 +1,26 @@
+[package]
+name = "flatter-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of hot kernels from flatter (fast lattice reduction)"
+license = "LGPL-3.0-or-later"
+autobenches = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "bench_gemm"
+path = "benches/bench_gemm.rs"
+bench = false
+
+[dependencies]
+rayon = "1.10"
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false

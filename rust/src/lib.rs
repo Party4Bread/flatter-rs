@@ -1,3 +1,4 @@
+#![allow(non_snake_case)]
 //! Rust port of flatter's elementary matrix-multiplication kernels.
 //!
 //! The C++ source lives at `src/problems/matrix_multiplication/elementary_native.cpp`
@@ -19,6 +20,14 @@
 
 pub mod gemm_f64;
 pub mod gemm_i64;
+pub mod lattice;
+pub mod profile;
+pub mod reduction;
+pub mod tri_matmul_mpfr;
 
 pub use gemm_f64::*;
 pub use gemm_i64::*;
+pub use lattice::*;
+pub use profile::*;
+pub use reduction::*;
+pub use tri_matmul_mpfr::*;

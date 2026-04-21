@@ -14,8 +14,14 @@ name = "bench_gemm"
 path = "benches/bench_gemm.rs"
 bench = false
 
+[[bin]]
+name = "flatter"
+path = "src/bin/flatter.rs"
+
 [dependencies]
 rayon = "1.10"
+rug = { version = "1.29", default-features = false, features = ["integer", "float"] }
+gmp-mpfr-sys = { version = "1.7", default-features = false, features = ["mpfr", "use-system-libs"] }
 
 [dev-dependencies]
 

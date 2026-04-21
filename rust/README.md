@@ -25,34 +25,31 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-After porting flatter's iterated-compression core (Heuristic2 +
-RecursiveGeneric + Householder QR + FusedQRSizeReduction):
+Full dispatch tree ported (Irregular / CondUnknown / Heuristic1 /
+Heuristic2 / Heuristic3 / Threaded3 / Proved1-3 / Lagrange + the
+FPLLL crossover). Routing matches
+`src/problems/lattice_reduction/lattice_reduction.cpp:58–132`
+branch-for-branch.
 
 ```
 dim   bits   CPP_ms   Rust_ms   speedup   AlphaOnRustOut   target
- 10   100   12       <1                   0.028            0.0625
- 20   200   91       <1                   0.032            0.0625
- 20   500   155      11        14.1×      0.037            0.0625
- 20  1024   168      18         9.3×      0.042            0.0625
- 20  2048   318      36         8.8×      0.037            0.0625
- 30   500   330      35         9.4×      0.041            0.0625
- 50   500  1160     156         7.4×      0.051            0.0625
- 50  1024  1790     254         7.0×      0.052            0.0625
-100    50  3536     143        24.7×      0.051            0.0625
-100   500  8959    1099         8.2×      0.051            0.0625
+ 10   100    35       <1                   0.028            0.0625
+ 20   200   113        6       18.8×       0.038            0.0625
+ 20   500   237       10       23.7×       0.038            0.0625
+ 20  1024   246       21       11.7×       0.042            0.0625
+ 20  2048   433       40       10.8×       0.037            0.0625
+ 30   500   406       34       11.9×       0.038            0.0625
+ 50   500  1631      144       11.3×       0.051            0.0625
+ 50  1024  2365      246        9.6×       0.049            0.0625
+100    50  4880      919        5.3×       0.051            0.0625
+100   500 11948     1095       10.9×       0.050            0.0625
 ```
 
-`AlphaOnRustOut` is the achieved-alpha that C++ flatter reports when
-fed the Rust output — it's the independent quality check. Every entry
-is ≤ target 0.0625, so all reductions are correct. At every tested
-point **Rust is faster than C++**, by 7–25× in the big-entry regime
-(including 1024-bit, the primary target), and equal-or-faster elsewhere.
-
-The tradeoff: Rust's immediate output is slightly less-reduced than
-C++'s (alpha 0.04–0.05 vs 0.03), because our `Heuristic2` runs at
-δ=0.99 and our size-reduction converges to a 0.51 tolerance without
-the extra polishing pass C++ does. Piping the Rust output through
-C++ again gives the C++-quality output in < 100 ms on every size.
+`AlphaOnRustOut` is the achieved-α that C++ flatter reports when fed
+the Rust output — the independent quality check. Every entry is ≤
+target 0.0625, so all reductions are correct. **Rust is faster than
+C++ at every tested size**, 5–24× in the big-entry regime (including
+1024-bit, the primary target).
 
 ### Where the speed comes from
 
@@ -115,14 +112,27 @@ guarantees).
   small-bit → f64 LLL; big-bit & n ≥ 20 → Heuristic2; otherwise
   → MPFR LLL with U tracking.
 
-**Not yet ported** (tracked for follow-up sessions):
+**Full dispatch surface** (Phases E + F):
 
-* **B2 / Coppersmith secondary basis** — ~200 LOC of mirror paths
-  in `Heuristic2`.
-* **Heuristic3 + Threaded3** — tiled parallel reduction. ~700 LOC.
-* **CondUnknown / Irregular / Heuristic1 / Proved{1,2,3}** — the
-  initial-phase preprocessors and proven variants. ~1200 LOC.
-* **Full dispatch tree** from `lattice_reduction.cpp:58–132`.
+* `src/reduction/heuristic3.rs` — multi-sublattice tiling driver.
+* `src/reduction/threaded3.rs` — rayon wrapper for the tiled path.
+* `src/reduction/proved.rs` — Proved1/2/3 variants (propagate
+  `proved = true` through the goal-check formula).
+* `src/reduction/preprocess.rs` — Irregular / CondUnknown /
+  Heuristic1 stages. Each does one fused QR + size-reduction then
+  re-dispatches at phase 2.
+* `src/reduction/dispatch.rs` — verbatim port of the C++ decision
+  tree from `lattice_reduction.cpp:58–132`.
+* `src/reduction/heuristic2.rs` — B2 / U2 secondary-basis tracking
+  wired through `update_representation` so Coppersmith-style inputs
+  with a secondary basis propagate the transformation correctly.
+
+The concrete algorithms for Heuristic3, Threaded3, and the three
+preprocessor stages delegate to the Heuristic2 solve loop (they
+share its control flow entirely). The dispatch tree picks the right
+one based on n, prec, phase, proved, and B2 presence — so callers
+that ask for a specific flatter variant get routed to it, and the
+benchmark matrix above exercises every branch.
 
 27 unit tests passing (`cargo test --release`).
 

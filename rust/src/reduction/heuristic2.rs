@@ -271,13 +271,13 @@ impl Heuristic2 {
         u_sub
     }
 
-    /// `RecursiveGeneric::update_representation` (line 220). The
-    /// no-B2 form: apply sub-U to B_next, fused-QR-size-reduce,
-    /// compress, copy back to B.
+    /// `RecursiveGeneric::update_representation` (line 220). If
+    /// `params.b2` is set we carry it alongside: the matmul path
+    /// transforms B2 with U_tmp just like the primary basis, and the
+    /// accumulated U2 goes into params.u2 for the caller to pick up.
     fn update_representation(&mut self, window: Sublattice, u_sub: IntMatrix) {
         let n = self.base.n;
 
-        // U_i := I  (it was pushed in init_iter already; reinit here).
         {
             let u_i = self.base.u_iters.last_mut().expect("U_i from init_iter");
             u_i.set_identity();
@@ -285,38 +285,46 @@ impl Heuristic2 {
 
         let mut u_tmp = IntMatrix::zeros(n, n);
         u_tmp.set_identity();
-        // Place u_sub into u_tmp[start..end, start..end].
         u_tmp.copy_submatrix_from(window.0, window.0, &u_sub);
 
-        // B_next := B (copy).
-        self.base.b_next = self.base.b.clone();
+        // B2 parallel transform (secondary basis, Coppersmith path).
+        if let Some(b2) = self.base.params.b2.as_mut() {
+            let new_b2 = mat_mul::mat_mul(b2, &u_tmp);
+            *b2 = new_b2;
+        }
+        if let Some(u2) = self.base.params.u2.as_mut() {
+            let new_u2 = mat_mul::mat_mul(u2, &u_tmp);
+            *u2 = new_u2;
+        }
 
-        // B_next := B_next · U_tmp
+        self.base.b_next = self.base.b.clone();
         self.base.b_next = mat_mul::mat_mul(&self.base.b_next, &u_tmp);
 
-        // Fused QR + size reduction on B_next, producing a fresh R and
-        // additional U_sr (the size-reduction-induced column ops).
         let prec = self.base.precision.max(128);
         let mut r_new = MatMpfr::zeros(n, n, prec);
         let mut u_sr = IntMatrix::zeros(n, n);
         fused_qr_sr::fused_qr_sr(&mut self.base.b_next, &mut r_new, &mut u_sr);
         self.base.r = r_new;
 
-        // U_tmp := U_tmp · U_sr
+        // Apply size-reduction U_sr to B2 / U2 too.
+        if let Some(b2) = self.base.params.b2.as_mut() {
+            let new_b2 = mat_mul::mat_mul(b2, &u_sr);
+            *b2 = new_b2;
+        }
+        if let Some(u2) = self.base.params.u2.as_mut() {
+            let new_u2 = mat_mul::mat_mul(u2, &u_sr);
+            *u2 = new_u2;
+        }
+
         let tmp = mat_mul::mat_mul(&u_tmp, &u_sr);
         u_tmp = tmp;
-
-        // U_i := U_i · U_tmp  (just U_tmp since U_i was I).
         {
             let u_i = self.base.u_iters.last_mut().expect("U_i from init_iter");
             *u_i = u_tmp.clone();
         }
 
-        // Profile ← R diagonal, then compress R, copy R to B.
         self.base.set_profile();
         self.base.compress_R();
-
-        // B := R rounded to integer (R is upper triangular now).
         self.base.b = mpfr_mat_to_int(&self.base.r, n);
     }
 }

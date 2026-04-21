@@ -24,7 +24,7 @@
 use rug::{Assign, Integer};
 
 use crate::lattice::{IntMatrix, Lattice};
-use crate::math::{fused_qr_sr, mat_mpfr::MatMpfr, mat_mul};
+use crate::math::{mat_mpfr::MatMpfr, mat_mul, qr};
 use crate::profile::Profile;
 use crate::reduction::params::LatticeReductionParams;
 use crate::reduction::recursive_generic::RecursiveGeneric;
@@ -169,8 +169,18 @@ impl Heuristic2 {
 
             self.base.init_iter();
             let window = self.setup_sublattice_reduction();
-            let sub_u = self.reduce_sub(window);
-            self.update_representation(window, sub_u);
+            let (sub_basis, u_sub, sub_profile) = self.reduce_sub(window);
+            // Dispatch to the correct C++ update_*_representation based
+            // on where the window sits — `heuristic_2.cpp:193`.
+            let (start, end) = window;
+            let n = self.base.n;
+            if start == 0 && end < n {
+                self.update_l_representation(window, sub_basis, u_sub, sub_profile);
+            } else if start > 0 && end == n {
+                self.update_r_representation(window, sub_basis, u_sub, sub_profile);
+            } else {
+                self.update_all_representation(window, u_sub, sub_profile);
+            }
 
             // fini_iter: advance the split.
             if let Some(split) = &self.base.params.split {
@@ -228,27 +238,23 @@ impl Heuristic2 {
     }
 
     /// Build a sub-Lattice from the current B at `[start..end,
-    /// start..end]`, recursively reduce it, return the U that
-    /// transforms the sub-basis.
-    fn reduce_sub(&self, window: Sublattice) -> IntMatrix {
+    /// start..end]`, recursively reduce it, return the reduced sub-basis
+    /// and the U that transforms it.
+    fn reduce_sub(&self, window: Sublattice) -> (IntMatrix, IntMatrix, Profile) {
         let (start, end) = window;
         let k = end - start;
 
         // sub_B = B[start..end, start..end]  (B is n×n upper-triangular)
         let sub_b = self.base.b.submatrix(start, end, start, end);
 
-        // Build a fresh Lattice for the sub-problem.
         let mut sub_lat = Lattice::new(k, k);
         sub_lat.basis = sub_b;
         sub_lat.rank = k;
         sub_lat.profile = Profile::new(k);
-        // Seed sub-profile from the current profile slice (used by
-        // is_reduced checks inside the sub-call).
         for i in 0..k {
             sub_lat.profile[i] = self.base.profile[start + i];
         }
 
-        // Build sub-params, descending to the matching child split.
         let child_split = self
             .base
             .params
@@ -259,73 +265,319 @@ impl Heuristic2 {
             .get_child_split(0);
         let sub_params = self.base.params.subparams(start, end, child_split);
 
-        // Recursively reduce. `reduce_with_u` wraps our LLL / inner
-        // Heuristic2 dispatch and tracks U for us.
         let mut u_sub = IntMatrix::zeros(k, k);
         u_sub.set_identity();
         crate::reduction::lll::reduce_with_u(&mut sub_lat, &sub_params, &mut u_sub);
 
-        // NOTE: we discard the reduced sub_lat.basis and sub_lat.profile
-        // here — `update_representation` recomputes R/profile on
-        // B_next, which already reflects the U_sub transform.
-        u_sub
+        (sub_lat.basis, u_sub, sub_lat.profile)
     }
 
-    /// `RecursiveGeneric::update_representation` (line 220). If
-    /// `params.b2` is set we carry it alongside: the matmul path
-    /// transforms B2 with U_tmp just like the primary basis, and the
-    /// accumulated U2 goes into params.u2 for the caller to pick up.
-    fn update_representation(&mut self, window: Sublattice, u_sub: IntMatrix) {
+    // -------------------------------------------------------------
+    // The three update paths from heuristic_2.cpp. Each one rebuilds
+    // R for a different slice of the basis — this is the key detail
+    // that propagates the sub-reduction's effect across block
+    // boundaries in the full lattice.
+    // -------------------------------------------------------------
+
+    /// `Heuristic2::update_L_representation` (heuristic_2.cpp:263).
+    /// Sub-window is `[0, end)` with `end < n`. QRs the TOP `end`
+    /// rows of the full basis (not just the `end × end` submatrix)
+    /// so the reduction propagates into the right columns.
+    fn update_l_representation(
+        &mut self,
+        window: Sublattice,
+        sub_basis: IntMatrix,
+        u_sub: IntMatrix,
+        sub_profile: Profile,
+    ) {
+        let (start, end) = window;
+        assert_eq!(start, 0);
         let n = self.base.n;
 
+        // profile[0..end] := sub_prof.
+        for i in 0..end {
+            self.base.profile[i] = sub_profile[i];
+        }
+
+        // U_i[start:end, start:end] := U_sub.
         {
-            let u_i = self.base.u_iters.last_mut().expect("U_i from init_iter");
+            let u_i = self.base.u_iters.last_mut().expect("U_i");
             u_i.set_identity();
+            u_i.copy_submatrix_from(start, start, &u_sub);
         }
 
-        let mut u_tmp = IntMatrix::zeros(n, n);
-        u_tmp.set_identity();
-        u_tmp.copy_submatrix_from(window.0, window.0, &u_sub);
+        // B_next[start:end, start:end] := L_sub.basis  (the reduced
+        // sub-basis; heuristic_2.cpp:309).
+        // B_next[start:end, end:n] := snapshot of B[start:end, end:n]
+        // (the "B2s" matrix in C++, just the right columns of B).
+        // B_next[end:n, end:n] := B[end:n, end:n] (unchanged).
+        self.base.b_next = IntMatrix::zeros(n, n);
+        self.base.b_next.copy_submatrix_from(start, start, &sub_basis);
+        let right_snapshot = self.base.b.submatrix(start, end, end, n);
+        self.base.b_next.copy_submatrix_from(start, end, &right_snapshot);
+        let untouched = self.base.b.submatrix(end, n, end, n);
+        self.base.b_next.copy_submatrix_from(end, end, &untouched);
 
-        // B2 parallel transform (secondary basis, Coppersmith path).
-        if let Some(b2) = self.base.params.b2.as_mut() {
-            let new_b2 = mat_mul::mat_mul(b2, &u_tmp);
-            *b2 = new_b2;
+        // R := B_next[0:end, 0:n] as MPFR, then Householder QR.
+        let spread = self.base.profile.get_spread();
+        let precision = self.base.get_precision_from_spread(spread);
+        let mut r = MatMpfr::zeros(end, n, precision);
+        for i in 0..end {
+            for j in 0..n {
+                r.get_mut(i, j).assign(self.base.b_next.get(i, j));
+            }
         }
-        if let Some(u2) = self.base.params.u2.as_mut() {
-            let new_u2 = mat_mul::mat_mul(u2, &u_tmp);
-            *u2 = new_u2;
+        let mut tau = Vec::new();
+        qr::householder_qr(&mut r, &mut tau);
+        qr::clear_subdiagonal(&mut r);
+
+        // profile[0..end] := log₂|R[i,i]|.
+        for i in 0..end {
+            let r_ii = r.get(i, i);
+            self.base.profile[i] = if r_ii.is_zero() {
+                f64::NEG_INFINITY
+            } else {
+                let (d, e) = r_ii.to_f64_exp();
+                d.abs().log2() + e as f64
+            };
         }
 
-        self.base.b_next = self.base.b.clone();
-        self.base.b_next = mat_mul::mat_mul(&self.base.b_next, &u_tmp);
-
-        let prec = self.base.precision.max(128);
-        let mut r_new = MatMpfr::zeros(n, n, prec);
-        let mut u_sr = IntMatrix::zeros(n, n);
-        fused_qr_sr::fused_qr_sr(&mut self.base.b_next, &mut r_new, &mut u_sr);
-        self.base.r = r_new;
-
-        // Apply size-reduction U_sr to B2 / U2 too.
-        if let Some(b2) = self.base.params.b2.as_mut() {
-            let new_b2 = mat_mul::mat_mul(b2, &u_sr);
-            *b2 = new_b2;
+        // Compute single uniform total_shift; apply to R (top end rows),
+        // profile, offsets, and B (bottom n-end rows untouched by QR).
+        let mut shifts = vec![0i32; n];
+        self.base.get_shifts_for_compression(&mut shifts);
+        let total_shift = shifts[0];
+        for s in shifts.iter_mut() {
+            *s = total_shift;
         }
-        if let Some(u2) = self.base.params.u2.as_mut() {
-            let new_u2 = mat_mul::mat_mul(u2, &u_sr);
-            *u2 = new_u2;
+        *self.base.compression_iters.last_mut().unwrap() = shifts;
+        for i in 0..n {
+            self.base.local_profile_offsets[i] += total_shift as f64;
+            self.base.global_profile_offsets[i] += total_shift as f64;
+            self.base.profile[i] -= total_shift as f64;
         }
 
-        let tmp = mat_mul::mat_mul(&u_tmp, &u_sr);
-        u_tmp = tmp;
+        // Scale R by 2^{-total_shift}, zero the strict lower.
+        for i in 0..end {
+            for j in 0..n {
+                if i > j {
+                    r.get_mut(i, j).assign(0);
+                } else {
+                    let cell = r.get_mut(i, j);
+                    if total_shift < 0 {
+                        *cell <<= (-total_shift) as u32;
+                    } else {
+                        *cell >>= total_shift as u32;
+                    }
+                }
+            }
+        }
+        // Scale the untouched bottom tile B[end:n, end:n] by same shift,
+        // zero strict lower (already upper-triangular so no-op).
+        for i in end..n {
+            for j in 0..n {
+                if i > j {
+                    self.base.b_next.set(i, j, rug::Integer::new());
+                } else if j >= end {
+                    let cell = self.base.b_next.get_mut(i, j);
+                    if total_shift < 0 {
+                        *cell <<= (-total_shift) as u32;
+                    } else {
+                        *cell >>= total_shift as u32;
+                    }
+                }
+            }
+        }
+
+        // B[0:end, 0:n] := R (rounded to integer). B[end:n, end:n] :=
+        // B_next[end:n, end:n] (already scaled).
+        self.base.b = IntMatrix::zeros(n, n);
+        let r_int = mpfr_mat_to_int_rows(&r, end, n);
+        self.base.b.copy_submatrix_from(0, 0, &r_int);
+        let bot = self.base.b_next.submatrix(end, n, end, n);
+        self.base.b.copy_submatrix_from(end, end, &bot);
+
+        // Keep R in state (bottom rows empty for the n × n slot,
+        // upper-triangular after QR + clear).
+        let mut full_r = MatMpfr::zeros(n, n, precision);
+        for i in 0..end {
+            for j in 0..n {
+                full_r.get_mut(i, j).assign(r.get(i, j));
+            }
+        }
+        self.base.r = full_r;
+        self.base.precision = precision;
+    }
+
+    /// `Heuristic2::update_R_representation` (heuristic_2.cpp:400).
+    /// Sub-window is `[start, n)` with `start > 0`. Uses
+    /// `RelativeSizeReduction` on the left tile before QR-ing the
+    /// bottom-right sub-matrix.
+    fn update_r_representation(
+        &mut self,
+        window: Sublattice,
+        sub_basis: IntMatrix,
+        u_sub: IntMatrix,
+        sub_profile: Profile,
+    ) {
+        let (start, end) = window;
+        let n = self.base.n;
+        assert_eq!(end, n);
+
+        for i in start..n {
+            self.base.profile[i] = sub_profile[i - start];
+        }
+
+        // U_i[start:n, start:n] := U_sub.
         {
-            let u_i = self.base.u_iters.last_mut().expect("U_i from init_iter");
-            *u_i = u_tmp.clone();
+            let u_i = self.base.u_iters.last_mut().expect("U_i");
+            u_i.set_identity();
+            u_i.copy_submatrix_from(start, start, &u_sub);
         }
 
-        self.base.set_profile();
-        self.base.compress_R();
-        self.base.b = mpfr_mat_to_int(&self.base.r, n);
+        // B_next[0:start, 0:start] := B[0:start, 0:start]
+        // B_next[0:start, start:n] := B[0:start, start:n] · U_sub   (matmul)
+        // B_next[start:n, start:n] := sub_basis
+        self.base.b_next = IntMatrix::zeros(n, n);
+        let left_top = self.base.b.submatrix(0, start, 0, start);
+        self.base.b_next.copy_submatrix_from(0, 0, &left_top);
+        let right_top = self.base.b.submatrix(0, start, start, n);
+        let right_top_updated = mat_mul::mat_mul(&right_top, &u_sub);
+        self.base.b_next.copy_submatrix_from(0, start, &right_top_updated);
+        self.base.b_next.copy_submatrix_from(start, start, &sub_basis);
+
+        // RelativeSizeReduction: reduce B_next[0:start, start:n]
+        // against B_next[0:start, 0:start] (which is upper-triangular).
+        let b1 = self.base.b_next.submatrix(0, start, 0, start);
+        let mut b2 = self.base.b_next.submatrix(0, start, start, n);
+        let mut u_sr_slice = IntMatrix::zeros(start, n - start);
+        {
+            let mut rsr = crate::math::rsr::RsrTriangular::new(&b1, &mut b2, &mut u_sr_slice);
+            rsr.solve();
+        }
+        // Write the reduced b2 and u_sr_slice back.
+        self.base.b_next.copy_submatrix_from(0, start, &b2);
+
+        // U_i := U_i · U_sr (where U_sr = I with u_sr_slice at
+        // [0:start, start:n]).
+        let mut u_sr_full = IntMatrix::zeros(n, n);
+        u_sr_full.set_identity();
+        u_sr_full.copy_submatrix_from(0, start, &u_sr_slice);
+        let u_i_new = {
+            let u_i = self.base.u_iters.last().unwrap();
+            mat_mul::mat_mul(u_i, &u_sr_full)
+        };
+        *self.base.u_iters.last_mut().unwrap() = u_i_new;
+
+        // R := B_next[start:n, start:n] as MPFR, then QR.
+        let k = n - start;
+        let spread = self.base.profile.get_spread();
+        let precision = self.base.get_precision_from_spread(spread);
+        let mut r = MatMpfr::zeros(k, k, precision);
+        for i in 0..k {
+            for j in 0..k {
+                r.get_mut(i, j).assign(self.base.b_next.get(start + i, start + j));
+            }
+        }
+        let mut tau = Vec::new();
+        qr::householder_qr(&mut r, &mut tau);
+        qr::clear_subdiagonal(&mut r);
+
+        // profile[start..n] := log₂|R[i-start, i-start]|.
+        for i in start..n {
+            let r_ii = r.get(i - start, i - start);
+            self.base.profile[i] = if r_ii.is_zero() {
+                f64::NEG_INFINITY
+            } else {
+                let (d, e) = r_ii.to_f64_exp();
+                d.abs().log2() + e as f64
+            };
+        }
+
+        // Single uniform total_shift, apply across the board.
+        let mut shifts = vec![0i32; n];
+        self.base.get_shifts_for_compression(&mut shifts);
+        let total_shift = shifts[0];
+        for s in shifts.iter_mut() {
+            *s = total_shift;
+        }
+        *self.base.compression_iters.last_mut().unwrap() = shifts;
+        for i in 0..n {
+            self.base.local_profile_offsets[i] += total_shift as f64;
+            self.base.global_profile_offsets[i] += total_shift as f64;
+            self.base.profile[i] -= total_shift as f64;
+        }
+
+        // Scale the bottom-right MPFR R by 2^{-total_shift}; zero lower.
+        for i in 0..k {
+            for j in 0..k {
+                if i > j {
+                    r.get_mut(i, j).assign(0);
+                } else {
+                    let cell = r.get_mut(i, j);
+                    if total_shift < 0 {
+                        *cell <<= (-total_shift) as u32;
+                    } else {
+                        *cell >>= total_shift as u32;
+                    }
+                }
+            }
+        }
+        // Scale the integer top-left untouched tile B_next[0:start, :] by same shift.
+        for i in 0..start {
+            for j in 0..n {
+                if i > j {
+                    self.base.b_next.set(i, j, rug::Integer::new());
+                } else {
+                    let cell = self.base.b_next.get_mut(i, j);
+                    if total_shift < 0 {
+                        *cell <<= (-total_shift) as u32;
+                    } else {
+                        *cell >>= total_shift as u32;
+                    }
+                }
+            }
+        }
+
+        // B := assemble from B_next (top-left) and R (bottom-right).
+        self.base.b = IntMatrix::zeros(n, n);
+        let top = self.base.b_next.submatrix(0, start, 0, n);
+        self.base.b.copy_submatrix_from(0, 0, &top);
+        let r_int = mpfr_mat_to_int_rows(&r, k, k);
+        self.base.b.copy_submatrix_from(start, start, &r_int);
+
+        // Stash R into state (upper-right of the n×n R matrix, zero-padded).
+        let mut full_r = MatMpfr::zeros(n, n, precision);
+        for i in 0..k {
+            for j in 0..k {
+                full_r.get_mut(start + i, start + j).assign(r.get(i, j));
+            }
+        }
+        self.base.r = full_r;
+        self.base.precision = precision;
+    }
+
+    /// `Heuristic2::update_all_representation` (heuristic_2.cpp:560).
+    /// Sub-window is the whole basis `[0, n)`. Just records U_i and
+    /// the sub-profile — no re-QR, no compression.
+    fn update_all_representation(
+        &mut self,
+        window: Sublattice,
+        u_sub: IntMatrix,
+        sub_profile: Profile,
+    ) {
+        let (start, end) = window;
+        assert_eq!(start, 0);
+        assert_eq!(end, self.base.n);
+
+        {
+            let u_i = self.base.u_iters.last_mut().expect("U_i");
+            u_i.set_identity();
+            u_i.copy_submatrix_from(start, start, &u_sub);
+        }
+        for i in 0..self.base.n {
+            self.base.profile[i] = sub_profile[i];
+        }
     }
 }
 
@@ -333,12 +585,18 @@ fn rounds_so_far(rg: &RecursiveGeneric) -> usize {
     rg.u_iters.len()
 }
 
-fn mpfr_mat_to_int(r: &MatMpfr, n: usize) -> IntMatrix {
-    let m = r.nrows;
-    let mut out = IntMatrix::zeros(m, n);
+#[allow(dead_code)]
+fn _mpfr_mat_to_int_full(r: &MatMpfr, n: usize) -> IntMatrix {
+    mpfr_mat_to_int_rows(r, r.nrows, n)
+}
+
+/// Round the top `rows` of an MPFR matrix `r` into a `rows × cols`
+/// integer matrix. Used by update_L / update_R to write R back into B.
+fn mpfr_mat_to_int_rows(r: &MatMpfr, rows: usize, cols: usize) -> IntMatrix {
+    let mut out = IntMatrix::zeros(rows, cols);
     let mut tmp = rug::Float::new(r.prec);
-    for i in 0..m {
-        for j in 0..n {
+    for i in 0..rows {
+        for j in 0..cols {
             rug::Assign::assign(&mut tmp, r.get(i, j));
             tmp.round_mut();
             if let Some(v) = tmp.clone().to_integer() {
@@ -346,6 +604,5 @@ fn mpfr_mat_to_int(r: &MatMpfr, n: usize) -> IntMatrix {
             }
         }
     }
-    let _ = Integer::new();
     out
 }

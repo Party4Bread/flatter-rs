@@ -25,31 +25,38 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-Full dispatch tree ported (Irregular / CondUnknown / Heuristic1 /
-Heuristic2 / Heuristic3 / Threaded3 / Proved1-3 / Lagrange + the
-FPLLL crossover). Routing matches
-`src/problems/lattice_reduction/lattice_reduction.cpp:58–132`
-branch-for-branch.
+Running `latticegen q d d/2 b b` and feeding both binaries:
 
 ```
-dim   bits   CPP_ms   Rust_ms   speedup   AlphaOnRustOut   target
- 10   100    35       <1                   0.028            0.0625
- 20   200   113        6       18.8×       0.038            0.0625
- 20   500   237       10       23.7×       0.038            0.0625
- 20  1024   246       21       11.7×       0.042            0.0625
- 20  2048   433       40       10.8×       0.037            0.0625
- 30   500   406       34       11.9×       0.038            0.0625
- 50   500  1631      144       11.3×       0.051            0.0625
- 50  1024  2365      246        9.6×       0.049            0.0625
-100    50  4880      919        5.3×       0.051            0.0625
-100   500 11948     1095       10.9×       0.050            0.0625
+dim   bits   CPP_ms   Rust_ms   AlphaOnRustOut   target
+ 20  1024   219       12        0.042            0.0625 ✓
+ 30   500   295       21        0.041            0.0625 ✓
+ 50   500  1020       81        0.051            0.0625 ✓
+ 50  1024  1590      140        0.052            0.0625 ✓
+100   500  7301      599        0.051            0.0625 ✓
 ```
 
-`AlphaOnRustOut` is the achieved-α that C++ flatter reports when fed
-the Rust output — the independent quality check. Every entry is ≤
-target 0.0625, so all reductions are correct. **Rust is faster than
-C++ at every tested size**, 5–24× in the big-entry regime (including
-1024-bit, the primary target).
+`AlphaOnRustOut` is the α that C++ flatter reports when it independently
+measures the Rust-produced basis. Every entry is ≤ target (0.0625), so
+every output is a valid LLL-reduced basis.
+
+**Correctness caveats to be honest about:**
+
+1. **Rust's self-reported α is wrong.** The CLI reports α based on
+   `self.base.profile`, which after `fini_solver` does not perfectly
+   reflect the output basis. The output basis itself is valid (as
+   confirmed by piping through C++ flatter, which re-measures from
+   the basis independently), but the Rust-side α printout is
+   unreliable. This is a bug in how `final_sr` updates the profile
+   and is tracked for next session.
+
+2. **Quality is slightly worse than C++ direct output.** On n=50 at
+   1024-bit, Rust's verified α is 0.052 vs. C++'s 0.050. Both are
+   under target, but C++'s internal polishing produces a
+   measurably-tighter reduction. The gap likely comes from the
+   unported CondUnknown pre-pass: C++ spends the first phase
+   estimating the condition number and picking precision adaptively,
+   which we skip.
 
 ### Where the speed comes from
 
@@ -112,29 +119,58 @@ guarantees).
   small-bit → f64 LLL; big-bit & n ≥ 20 → Heuristic2; otherwise
   → MPFR LLL with U tracking.
 
-**Full dispatch surface** (Phases E + F):
+**Ports that ship now** (all genuinely ported from C++, none stubs):
 
-* `src/reduction/heuristic3.rs` — multi-sublattice tiling driver.
-* `src/reduction/threaded3.rs` — rayon wrapper for the tiled path.
-* `src/reduction/proved.rs` — Proved1/2/3 variants (propagate
-  `proved = true` through the goal-check formula).
-* `src/reduction/preprocess.rs` — Irregular / CondUnknown /
-  Heuristic1 stages. Each does one fused QR + size-reduction then
-  re-dispatches at phase 2.
-* `src/reduction/dispatch.rs` — verbatim port of the C++ decision
-  tree from `lattice_reduction.cpp:58–132`.
-* `src/reduction/heuristic2.rs` — B2 / U2 secondary-basis tracking
-  wired through `update_representation` so Coppersmith-style inputs
-  with a secondary basis propagate the transformation correctly.
+* `src/math/qr.rs` — Householder QR (port of
+  `householder_mpfr.cpp`'s `larfg`/`larf`).
+* `src/math/fused_qr_sr.rs` — fused QR + size reduction (port of
+  `columnwise.cpp`).
+* `src/math/size_reduce_r.rs` — size-reduction of R.
+* `src/math/rsr.rs` — `RelativeSizeReduction::Triangular` (port of
+  `triangular.cpp`).
+* `src/math/mat_mul.rs`, `mat_mpfr.rs` — primitives.
+* `src/reduction/sublattice_split.rs` — Phase2 + Phase3 splitters.
+* `src/reduction/goal.rs` — full C++ `LatticeReductionGoal` surface.
+* `src/reduction/params.rs` — `LatticeReductionParams`.
+* `src/reduction/recursive_generic.rs` — shared plumbing
+  (`init_solver`, `compress_R`, `get_shifts_for_compression`,
+  `collect_U`, `final_sr`).
+* `src/reduction/heuristic2.rs` — single-sublattice iterated
+  compression with **three distinct update paths** (L / R / all)
+  from `heuristic_2.cpp:263/400/560`, using `RelativeSizeReduction`
+  on the R path and QR on the augmented top-rows / bottom-rows
+  matrix on L and R respectively. B2 / U2 propagation is wired
+  through where the code paths need it.
+* `src/reduction/lll.rs` — classical LLL (f64 + MPFR, U-tracking).
+* `src/reduction/lagrange.rs` — n ≤ 2 (Gauss reduction).
 
-The concrete algorithms for Heuristic3, Threaded3, and the three
-preprocessor stages delegate to the Heuristic2 solve loop (they
-share its control flow entirely). The dispatch tree picks the right
-one based on n, prec, phase, proved, and B2 presence — so callers
-that ask for a specific flatter variant get routed to it, and the
-benchmark matrix above exercises every branch.
+**Not yet ported — and not stubbed**:
 
-27 unit tests passing (`cargo test --release`).
+I had earlier committed thin stubs that delegated to Heuristic2.
+Those were misleading and have been removed. These remain to be
+actually ported:
+
+* **Heuristic3 / Threaded3** — multi-sublattice tiled reduction.
+  C++ uses it for n ≥ some threshold and for parallelism. Needs
+  `heuristic_3.cpp`'s tile-update-representation (~400 LOC) plus
+  the `RelativeSizeReduction` paths it uses between tiles.
+* **Proved1/2/3** — proven-quality variants. Not just a `proved`
+  flag — they have distinct `get_precision_from_spread`, different
+  termination conditions, and pick different sub-goals.
+* **CondUnknown / Irregular / Heuristic1** — phase-0/1
+  preprocessors. CondUnknown estimates condition number via
+  preliminary LLL; Irregular handles rank-deficient inputs;
+  Heuristic1 runs at a user-specified condition-number hint.
+* **Schoenhage** — n ≤ 2 with prec ≥ 1400.
+* **Orthogonal / OrthogonalDouble / Generic `RelativeSizeReduction`
+  variants** — only `Triangular` is ported; the other three
+  specializations (used by CondUnknown and Heuristic3) are not.
+
+When inputs route to any of the unported paths, the dispatch falls
+through to classical LLL-in-MPFR rather than silently running a
+different algorithm.
+
+28 unit tests passing (`cargo test --release`).
 
 ## Build
 

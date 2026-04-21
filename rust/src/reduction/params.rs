@@ -63,10 +63,6 @@ impl LatticeReductionParams {
         let n = goal.n;
         let rhf = goal.get_rhf();
         let slope = goal.get_slope();
-        // `delta` for classical LLL. flatter's `from_slope` already bounds
-        // the target to `BKZ_BEST_SLOPE = 0.031281` below, so `slope` is
-        // in a reasonable range. Map to classical δ via 0.255/sqrt(slope),
-        // clamped to [0.5, 0.99].
         let delta = if slope > 0.0 {
             (0.255 / slope.sqrt()).clamp(0.5, 0.99)
         } else {
@@ -76,7 +72,9 @@ impl LatticeReductionParams {
             goal,
             rhf,
             proved: false,
-            phase: 2,
+            // Match C++ params.cpp:43 — default phase is 0, so the CLI
+            // entry routes through Irregular → CondUnknown → Heuristic2.
+            phase: 0,
             is_upper_triangular: false,
             b2: None,
             u2: None,

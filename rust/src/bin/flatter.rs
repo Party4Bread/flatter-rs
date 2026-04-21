@@ -213,7 +213,7 @@ fn run() -> Result<(), String> {
         eprintln!();
     }
 
-    if args.verbose {
+    if args.verbose && L.rank > 0 && !L.profile.is_empty() {
         let n = L.rank.max(1);
         let logdet: f64 = L.profile.logdet();
         let log_rhf = (L.profile[0] - logdet / n as f64) / n as f64;

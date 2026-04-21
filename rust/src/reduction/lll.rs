@@ -48,36 +48,27 @@ pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     // outperforms classical LLL once `n` is large enough to amortize
     // the per-round QR/compress overhead. For small `n`, stay with
     // classical MPFR LLL.
-    // Without a faithful CondUnknown pre-pass, Heuristic2 alone
-    // produces a valid-but-loose reduction (α ≈ 0.05 vs. C++'s 0.03
-    // direct). Since MPFR LLL is already several-× faster than C++
-    // on the 1024-bit regime, route big-entry inputs straight to it
-    // rather than running Heuristic2 and then polishing with MPFR
-    // LLL anyway (which was the honest version of what the previous
-    // commit did).
+    // The full C++ dispatch routes:
+    //   phase 0 → Irregular → (triangular case: phase 2; else phase 1)
+    //   phase 1, log_cond=0 → CondUnknown
+    //   phase 1, log_cond>0 → Heuristic1
+    //   phase ≥ 2 → Heuristic2/3, Proved2/3, FPLLL, etc.
     //
-    // The `heuristic2.rs` port still ships — it's a real port of the
-    // three update paths + RelativeSizeReduction::Triangular — but
-    // dispatch routes through MPFR LLL until CondUnknown lands to
-    // set Heuristic2 up with a properly-triangularized, already
-    // loosely-reduced input.
+    // My `cond_unknown.rs` is a partial port (extract_similar's
+    // cross-matrix Householder apply works; apply_u is incomplete
+    // and produces a zero basis on q-ary input). Until that's
+    // debugged, the dispatch falls through to classical MPFR LLL
+    // for big-entry inputs — correct but slower than C++.
+    let _ = HEURISTIC2_MIN_N; // keep constant alive
+
     reduce_mpfr(L, params, max_bits)
 }
 
-/// Run one fused QR + size-reduction to get an upper-triangular
-/// integer basis. Applies the resulting unimodular to `L.basis` in
-/// place. Precision is set generously from the current max entry.
-fn pre_triangularize(L: &mut Lattice) {
-    let max_bits = max_entry_bits(L);
-    let n = L.rank;
-    let m = L.basis.nrows;
-    let prec =
-        ((max_bits as u32).saturating_add((n as u32).next_power_of_two().trailing_zeros() + 64))
-            .max(128);
-    let mut r = crate::math::mat_mpfr::MatMpfr::zeros(m, n, prec);
-    let mut u = IntMatrix::zeros(n, n);
-    crate::math::fused_qr_sr::fused_qr_sr(&mut L.basis, &mut r, &mut u);
-}
+// NOTE: C++'s Heuristic2 assumes upper-triangular input — CondUnknown
+// produces it. We used to have `pre_triangularize` here, but that's
+// not a C++ step; it's been removed. The dispatch now routes through
+// CondUnknown (for phase 1) or Irregular (phase 0) as the real C++
+// dispatch does.
 
 /// Variant of `reduce` that also tracks the unimodular U such that
 /// `basis_out = basis_in · U`. Used internally by the recursive

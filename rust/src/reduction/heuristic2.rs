@@ -47,15 +47,13 @@ impl Heuristic2 {
         Self { base }
     }
 
-    /// Heuristic2-specific init. Computes QR of the outer basis
-    /// (producing an upper-triangular R), reads the profile from R's
-    /// diagonal, and compresses R into the integer shadow B using a
-    /// **single uniform shift** (heuristic_2.cpp:218–224).
-    ///
-    /// Unlike the C++ version — which assumes M is already upper
-    /// triangular on entry and just reads M[i, i] — we handle arbitrary
-    /// input bases by doing the QR ourselves. That covers the normal
-    /// q-ary input format from latticegen.
+    /// Heuristic2-specific init. Matches `heuristic_2.cpp:206–261`.
+    /// Assumes `M` is already upper-triangular (the caller — CondUnknown
+    /// or Irregular in C++ — is responsible for that). Reads profile
+    /// from `M`'s diagonal, computes per-column shifts via
+    /// `get_shifts_for_compression`, unifies them to a single
+    /// `total_shift = shifts[0]`, and scales `M`'s upper triangle by
+    /// `2^{-total_shift}` into `B`.
     fn init_solver_heuristic2(&mut self) {
         let n = self.base.n;
         let m = self.base.m;
@@ -71,26 +69,21 @@ impl Heuristic2 {
         self.base.u_iters.clear();
         self.base.compression_iters.clear();
 
-        // 1. QR-factor the outer basis into R (upper triangular, MPFR).
-        let precision = self.base.get_initial_precision();
-        self.base.original_precision = precision;
-        self.base.precision = precision;
-        self.base.r = MatMpfr::zeros(m, n, precision);
-        for i in 0..m {
-            for j in 0..n {
-                self.base.r.get_mut(i, j).assign(self.base.outer_m.get(i, j));
-            }
+        // 1. Read profile from M's diagonal (heuristic_2.cpp:209–214).
+        //    This requires M to be upper-triangular.
+        for i in 0..n {
+            let v = self.base.outer_m.get(i, i);
+            let new_val = if v.is_zero() {
+                f64::NEG_INFINITY
+            } else {
+                let (d, exp) = v.to_f64_exp();
+                d.abs().log2() + exp as f64
+            };
+            self.base.profile[i] = new_val;
         }
-        let mut tau = Vec::new();
-        crate::math::qr::householder_qr(&mut self.base.r, &mut tau);
-        crate::math::qr::clear_subdiagonal(&mut self.base.r);
 
-        // 2. Read profile from R[i, i].
-        self.base.set_profile();
-
-        // 3. Compute per-column shifts then UNIFY to shifts[0]
-        //    (heuristic_2.cpp:218–224). A single uniform shift keeps
-        //    the profile SHAPE intact so `is_reduced` is meaningful.
+        // 2. Compute per-column shifts then UNIFY to shifts[0]
+        //    (heuristic_2.cpp:218–224).
         let mut shifts = vec![0i32; n];
         self.base.get_shifts_for_compression(&mut shifts);
         let total_shift = shifts[0];
@@ -99,35 +92,35 @@ impl Heuristic2 {
         }
         self.base.compression_iters.push(shifts);
 
-        // 4. Apply total_shift to profile and offsets.
+        // 3. Apply total_shift (heuristic_2.cpp:233–237).
         for i in 0..n {
             self.base.local_profile_offsets[i] += total_shift as f64;
             self.base.global_profile_offsets[i] += total_shift as f64;
             self.base.profile[i] -= total_shift as f64;
         }
 
-        // 5. B := round(R · 2^{-total_shift}) — integer upper-triangular
-        //    shadow. R being upper-triangular means B is too.
-        let mut tmp = rug::Float::new(precision);
+        // 4. B := M scaled by 2^{-total_shift}, strict lower zeroed
+        //    (heuristic_2.cpp:239–260).
         for i in 0..n {
             for j in 0..n {
                 if i > j {
                     self.base.b.set(i, j, rug::Integer::new());
                 } else {
-                    rug::Assign::assign(&mut tmp, self.base.r.get(i, j));
+                    let mut v = self.base.outer_m.get(i, j).clone();
                     if total_shift < 0 {
-                        tmp <<= (-total_shift) as u32;
+                        v <<= (-total_shift) as u32;
                     } else {
-                        tmp >>= total_shift as u32;
+                        v >>= total_shift as u32;
                     }
-                    tmp.round_mut();
-                    let v = tmp.clone().to_integer().unwrap_or_else(rug::Integer::new);
                     self.base.b.set(i, j, v);
                 }
             }
         }
 
         self.base.lattice_changed = true;
+
+        // Precision set to a reasonable value; C++ sets prec=53 here.
+        self.base.precision = 53;
     }
 
     /// Top-level solve: returns (final profile, number of outer
@@ -192,24 +185,12 @@ impl Heuristic2 {
         (self.base.profile.clone(), rounds)
     }
 
-    /// `Heuristic2::is_reduced` (heuristic_2.cpp:19).
-    ///
-    /// Note on the `iterations == 0` short-circuit: C++ checks the
-    /// raw profile directly, but in our port the profile at this
-    /// point has been run through `compress_R`, which subtracts the
-    /// shift vector and flattens it artificially. So we must reapply
-    /// the local offsets to compare against the uncompressed goal.
-    /// `Heuristic2::is_reduced` (heuristic_2.cpp:19).
-    ///
-    /// The C++ code short-circuits on `iterations == 0 &&
-    /// goal.check(profile)` — but that path relies on CondUnknown
-    /// having produced a DESCENDING profile already. For a raw q-ary
-    /// input (ascending profile), `profile.get_drop()` is 0 and
-    /// `goal.check` would trivially pass, which causes Heuristic2 to
-    /// return without doing any work. Since we don't have CondUnknown
-    /// yet, we drop the iter==0 short-circuit and always run through
-    /// the Phase-2 schedule.
+    /// `Heuristic2::is_reduced` (heuristic_2.cpp:19) — faithful.
     fn is_reduced(&self) -> bool {
+        let iter = self.base.u_iters.len();
+        if iter == 0 && self.base.params.goal.check(&self.base.profile) {
+            return true;
+        }
         self.base
             .params
             .split

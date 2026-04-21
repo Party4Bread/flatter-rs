@@ -139,7 +139,9 @@ guarantees).
   small-bit → f64 LLL; big-bit & n ≥ 20 → Heuristic2; otherwise
   → MPFR LLL with U tracking.
 
-**Ports that ship now** (all genuinely ported from C++, none stubs):
+### What's genuinely ported vs. still work-in-progress
+
+**Primitives** (faithful C++ ports, verified against their sources):
 
 * `src/math/qr.rs` — Householder QR (port of
   `householder_mpfr.cpp`'s `larfg`/`larf`).
@@ -148,6 +150,8 @@ guarantees).
 * `src/math/size_reduce_r.rs` — size-reduction of R.
 * `src/math/rsr.rs` — `RelativeSizeReduction::Triangular` (port of
   `triangular.cpp`).
+* `src/math/size_reduction.rs` — `SizeReduction::ElementaryZZ` (port
+  of `elementary_ZZ.cpp`).
 * `src/math/mat_mul.rs`, `mat_mpfr.rs` — primitives.
 * `src/reduction/sublattice_split.rs` — Phase2 + Phase3 splitters.
 * `src/reduction/goal.rs` — full C++ `LatticeReductionGoal` surface.
@@ -155,14 +159,26 @@ guarantees).
 * `src/reduction/recursive_generic.rs` — shared plumbing
   (`init_solver`, `compress_R`, `get_shifts_for_compression`,
   `collect_U`, `final_sr`).
-* `src/reduction/heuristic2.rs` — single-sublattice iterated
-  compression with **three distinct update paths** (L / R / all)
-  from `heuristic_2.cpp:263/400/560`, using `RelativeSizeReduction`
-  on the R path and QR on the augmented top-rows / bottom-rows
-  matrix on L and R respectively. B2 / U2 propagation is wired
-  through where the code paths need it.
+* `src/reduction/heuristic2.rs` — faithful single-sublattice
+  iterated compression with **three distinct update paths** (L / R /
+  all) from `heuristic_2.cpp:263/400/560`. `init_compressed_B`
+  reads `M`'s diagonal (assuming upper-triangular input per
+  heuristic_2.cpp:206). `is_reduced` includes the iter-0 goal check
+  per heuristic_2.cpp:19. No extra QR inserted.
 * `src/reduction/lll.rs` — classical LLL (f64 + MPFR, U-tracking).
 * `src/reduction/lagrange.rs` — n ≤ 2 (Gauss reduction).
+
+**Work-in-progress** (started but doesn't produce correct output):
+
+* `src/reduction/cond_unknown.rs` — ~300 LOC port of
+  `cond_unknown.cpp`. `extract_similar` works (column selection,
+  cross-matrix Householder apply). `refine_basis` compiles and the
+  control flow matches the C++ source. **Bug**: `apply_u` composes
+  U_1 (independent block) and U_2 (dependent block) into the outer
+  `B` incorrectly, producing a zero basis. The dispatch doesn't
+  route through CondUnknown yet — falls back to MPFR LLL until the
+  apply_u bug is fixed. Keeping the module in-tree so the
+  debugging work is visible.
 
 **Not yet ported — and not stubbed**:
 

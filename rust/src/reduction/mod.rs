@@ -25,6 +25,7 @@
 //! correct-but-slow on those inputs rather than silently
 //! mis-reducing.
 
+pub mod cond_unknown;
 pub mod goal;
 pub mod heuristic;
 pub mod heuristic2;

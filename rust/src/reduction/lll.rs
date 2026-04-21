@@ -1,77 +1,113 @@
-//! Classical LLL reduction with double-precision Gram-Schmidt and exact
-//! integer basis updates (via `rug::Integer` = GMP `mpz_t`). This stands
-//! in for two dispatch paths in `src/problems/lattice_reduction/lattice_reduction.cpp`:
+//! Classical LLL reduction with exact integer basis updates (via
+//! `rug::Integer` = GMP `mpz_t`) and two interchangeable Gram-Schmidt
+//! paths:
 //!
-//!   1. The `FPLLL` branch (line 103-108), which the C++ code uses for
-//!      n ≤ 32 && prec ≤ 128. That branch just calls the external fplll
-//!      library's LLL — we do the same thing natively.
-//!   2. A working fallback for n > 32, where the C++ code would use the
-//!      heuristic iterated-compression core (Heuristic2/3, Threaded3). We
-//!      produce a correct LLL-reduced basis; we do NOT yet reproduce the
-//!      asymptotic speedup of the iterated-compression algorithm. That
-//!      core is tracked for the next session.
+//! * **f64 GSO** (default) — fast; works when entries fit comfortably
+//!   in double precision (roughly max-bit ≤ 900 before pow/exp
+//!   saturation becomes a risk).
+//! * **MPFR GSO** (auto-selected when entries are too big) — arbitrary
+//!   precision via `rug::Float`. Handles thousands-of-bits entries,
+//!   matching the C++ flatter's MPFR path in
+//!   `src/problems/qr_factorization/householder_mpfr.cpp`.
 //!
-//! The algorithm is the classical Lenstra-Lenstra-Lovász procedure from
-//! "Factoring Polynomials with Rational Coefficients" (1982), using
-//! `delta ∈ [0.5, 0.99]`. The GSO is maintained in `f64`, which is fine
-//! for entries up to roughly 2^50 in magnitude — which covers the qary
-//! lattice sizes in `scripts/` and is the same precision fplll uses in
-//! its default (non-proved) mode.
+//! The two paths share the incremental swap update (Cohen Alg 2.6.3) —
+//! only the arithmetic type changes.
 
-use rug::{Assign, Integer};
+use rug::{ops::CompleteRound, Assign, Float, Integer};
 
 use crate::lattice::Lattice;
 use crate::profile::Profile;
 use crate::reduction::params::LatticeReductionParams;
 
-/// Run LLL in-place on `L` and set `L.profile` to `log2(|b*_i|)`.
-/// Returns the number of outer iterations taken (for logging).
-pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
-    let n = L.rank;
-    let _m = L.dimension();
-    let delta = params.delta;
+/// Maximum absolute entry bit-length at which the f64 GSO is trusted.
+/// Below this we use f64 (fast); above, we switch to MPFR.
+///
+/// f64 has a 53-bit mantissa and an 11-bit exponent. The dot-product in
+/// compute_gso squares an entry and sums n of them, so the magnitude of
+/// a single intermediate is up to `n · (2^bits)²`. To stay well under
+/// `f64::MAX ≈ 2^1023` with room for the GSO's repeated subtractions
+/// (which lose relative precision proportional to `bits`), we cap at a
+/// tight 300 bits. Above this, the MPFR path runs and is correct up to
+/// arbitrary precision.
+const F64_MAX_BITS: u64 = 300;
 
+/// Run LLL in-place on `L` and set `L.profile`. Returns the number of
+/// outer iterations for logging.
+pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
+    let max_bits = max_entry_bits(L);
+    if max_bits <= F64_MAX_BITS {
+        reduce_f64(L, params)
+    } else {
+        reduce_mpfr(L, params, max_bits)
+    }
+}
+
+fn max_entry_bits(L: &Lattice) -> u64 {
+    let mut mx: u64 = 0;
+    for e in &L.basis.data {
+        let b = e.significant_bits() as u64;
+        if b > mx {
+            mx = b;
+        }
+    }
+    mx
+}
+
+/// Maximum number of LLL outer iterations for an n-vector lattice with
+/// `max_bits`-bit entries. The classical LLL bound is
+/// `O(n² · log_{1/δ}(det))`; `log(det)` is at most `n · max_bits`, so
+/// `n³ · max_bits` is a safe upper bound. We multiply by a small
+/// constant and floor at a sensible minimum.
+fn iter_cap(n: usize, max_bits: u64) -> usize {
+    let n3 = (n as u64).saturating_mul(n as u64).saturating_mul(n as u64);
+    let bits = max_bits.max(32);
+    let cap = n3.saturating_mul(bits).saturating_mul(4);
+    (cap as usize).max(100_000)
+}
+
+// ---------------------------------------------------------------------------
+// f64 path
+// ---------------------------------------------------------------------------
+
+fn reduce_f64(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
+    let n = L.rank;
+    let delta = params.delta;
     if n == 0 {
         return 0;
     }
 
-    // `mu[k][j]` for j < k is the Gram-Schmidt coefficient,
-    // `bstar_sq[k]` is ||b*_k||^2. Initial full GSO is O(n² · dim); each
-    // swap after that updates GSO in O(n) via the incremental formulas
-    // from Cohen Alg 2.6.3 (see `swap_update` below).
     let mut mu = vec![vec![0.0f64; n]; n];
     let mut bstar_sq = vec![0.0f64; n];
 
-    compute_gso(L, &mut mu, &mut bstar_sq);
+    compute_gso_f64(L, &mut mu, &mut bstar_sq);
+
+    // Iteration cap scales with the initial log-determinant: LLL is
+    // guaranteed to converge in O(n² · log₁/δ(det)) swaps.
+    let cap = iter_cap(n, max_entry_bits(L));
 
     let mut iters = 0usize;
     let mut k = 1usize;
     while k < n {
         iters += 1;
-        size_reduce(L, k, &mut mu);
+        size_reduce_f64(L, k, &mut mu);
 
-        // Lovász condition: ||b*_k||² ≥ (δ − μ_{k,k-1}²) · ||b*_{k-1}||²
         let ok = bstar_sq[k] + mu[k][k - 1].powi(2) * bstar_sq[k - 1]
             >= delta * bstar_sq[k - 1];
         if ok {
             k += 1;
         } else {
             swap_cols(L, k - 1, k);
-            swap_update(&mut mu, &mut bstar_sq, k, n);
+            swap_update_f64(&mut mu, &mut bstar_sq, k, n);
             if k > 1 {
                 k -= 1;
             }
         }
 
-        // Defensive cap. Under well-behaved inputs LLL is O(n² · log(det))
-        // swaps; this bound is loose and catches pathological cases
-        // without ever triggering on realistic input.
-        if iters > 200 * n * n.max(1) {
+        if iters > cap {
             break;
         }
     }
 
-    // Profile := log2(||b*_i||)  (== 0.5 · log2(||b*_i||²))
     L.profile = Profile::new(n);
     for i in 0..n {
         L.profile[i] = if bstar_sq[i] > 0.0 {
@@ -94,7 +130,7 @@ pub fn fill_profile(L: &mut Lattice) {
     }
     let mut mu = vec![vec![0.0f64; n]; n];
     let mut bstar_sq = vec![0.0f64; n];
-    compute_gso(L, &mut mu, &mut bstar_sq);
+    compute_gso_f64(L, &mut mu, &mut bstar_sq);
     L.profile = Profile::new(n);
     for i in 0..n {
         L.profile[i] = if bstar_sq[i] > 0.0 {
@@ -105,21 +141,17 @@ pub fn fill_profile(L: &mut Lattice) {
     }
 }
 
-/// Incremental GSO update after swapping basis columns `k-1` and `k`.
-/// Direct port of Cohen's *A Course in Computational Algebraic Number
-/// Theory* Algorithm 2.6.3, SWAP step. O(n) — beats the full O(n² · dim)
-/// recompute asymptotically and measurably.
-fn swap_update(mu: &mut [Vec<f64>], bstar_sq: &mut [f64], k: usize, n: usize) {
+/// Incremental GSO update after swapping basis columns `k-1` and `k`
+/// (Cohen Alg 2.6.3, SWAP step). O(n) — the key optimization that
+/// makes LLL practical above n ≈ 20.
+fn swap_update_f64(mu: &mut [Vec<f64>], bstar_sq: &mut [f64], k: usize, n: usize) {
     debug_assert!(k >= 1);
-    let mu_val = mu[k][k - 1];                          // old μ_{k,k-1}
-    let b_km1 = bstar_sq[k - 1];                        // old ||b*_{k-1}||²
-    let b_k = bstar_sq[k];                              // old ||b*_k||²
-    let b_new = b_k + mu_val * mu_val * b_km1;          // new ||b*_{k-1}||²
+    let mu_val = mu[k][k - 1];
+    let b_km1 = bstar_sq[k - 1];
+    let b_k = bstar_sq[k];
+    let b_new = b_k + mu_val * mu_val * b_km1;
 
-    // Edge case: both old b*_k and old b*_{k-1} were zero. Treat as no-op;
-    // the basis is effectively rank-deficient at this position.
     if b_new == 0.0 {
-        // Swap rows k-1 and k of μ (columns < k-1) and zero the rest.
         for j in 0..k.saturating_sub(1) {
             let t = mu[k - 1][j];
             mu[k - 1][j] = mu[k][j];
@@ -136,14 +168,12 @@ fn swap_update(mu: &mut [Vec<f64>], bstar_sq: &mut [f64], k: usize, n: usize) {
     bstar_sq[k] = new_b_k;
     mu[k][k - 1] = new_mu_kkm1;
 
-    // Columns j < k-1 of the μ table: rows k-1 and k just exchanged.
     for j in 0..k.saturating_sub(1) {
         let t = mu[k - 1][j];
         mu[k - 1][j] = mu[k][j];
         mu[k][j] = t;
     }
 
-    // Rows i > k: update columns k-1 and k in tandem.
     for i in (k + 1)..n {
         let t = mu[i][k];
         mu[i][k] = mu[i][k - 1] - mu_val * t;
@@ -165,7 +195,7 @@ fn swap_cols(L: &mut Lattice, a: usize, b: usize) {
 /// Size reduction of column `k` against columns `0..k`. Updates the
 /// Gram-Schmidt coefficients in `mu` to match. After this, every
 /// `mu[k][j]` for `j < k` satisfies `|mu[k][j]| <= 1/2`.
-fn size_reduce(L: &mut Lattice, k: usize, mu: &mut [Vec<f64>]) {
+fn size_reduce_f64(L: &mut Lattice, k: usize, mu: &mut [Vec<f64>]) {
     if k == 0 {
         return;
     }
@@ -181,44 +211,35 @@ fn size_reduce(L: &mut Lattice, k: usize, mu: &mut [Vec<f64>]) {
         }
         let q = mu_kj.round();
         q_z.assign(q as i64);
-        // Exact: B[:, k] -= q * B[:, j]. j != k so the two columns are
-        // disjoint within each row — we split each row via split_at_mut.
         for i in 0..dim {
             let row = &mut L.basis.data[i * nc..(i + 1) * nc];
             let (b_ij, b_ik) = {
-                let (lo, hi) = if j < k { (j, k) } else { (k, j) };
-                let (left, right) = row.split_at_mut(hi);
+                let (left, right) = row.split_at_mut(k);
                 if j < k {
-                    (&left[lo], &mut right[0])
+                    (&left[j], &mut right[0])
                 } else {
-                    (&right[0], &mut left[lo])
+                    unreachable!()
                 }
             };
             tmp.assign(b_ij);
             tmp *= &q_z;
             *b_ik -= &tmp;
         }
-        // mu_{k, r} -= q * mu_{j, r}  for r < j, and mu_{k, j} -= q * 1.
-        // Since mu[j][j] = 1, a single `r in 0..=j` loop handles both.
         for r in 0..=j {
             mu[k][r] -= q * mu[j][r];
         }
     }
 }
 
-/// Full Gram-Schmidt orthogonalization, `f64` precision. Writes
-/// `mu[k][j]` for `j < k` and `bstar_sq[k] = ||b*_k||^2`.
-fn compute_gso(L: &Lattice, mu: &mut [Vec<f64>], bstar_sq: &mut [f64]) {
+/// Full Gram-Schmidt orthogonalization at f64 precision.
+fn compute_gso_f64(L: &Lattice, mu: &mut [Vec<f64>], bstar_sq: &mut [f64]) {
     let n = L.rank;
     let dim = L.basis.nrows;
 
-    // Convert the basis to f64 once. Entries too big for f64 saturate to
-    // +/- inf, which will poison the GSO — acceptable for now, since
-    // flatter's own FPLLL dispatch only fires on prec ≤ 128 too.
     let mut b_f = vec![0.0f64; dim * n];
     for j in 0..n {
         for i in 0..dim {
-            b_f[i * n + j] = int_to_f64(L.basis.get(i, j));
+            b_f[i * n + j] = L.basis.get(i, j).to_f64();
         }
     }
 
@@ -254,11 +275,230 @@ fn compute_gso(L: &Lattice, mu: &mut [Vec<f64>], bstar_sq: &mut [f64]) {
     }
 }
 
-/// Best-effort conversion of a (possibly huge) integer to f64. Equivalent
-/// to `mpz_get_d` in GMP. Saturates to +/- inf for entries above
-/// ~2^1024.
-fn int_to_f64(z: &Integer) -> f64 {
-    z.to_f64()
+// ---------------------------------------------------------------------------
+// MPFR path — same algorithm as the f64 path, arithmetic in `rug::Float`.
+// Picked automatically for bases with max-entry bit-length > F64_MAX_BITS.
+// ---------------------------------------------------------------------------
+
+fn reduce_mpfr(L: &mut Lattice, params: &LatticeReductionParams, max_bits: u64) -> usize {
+    let n = L.rank;
+    let delta = params.delta;
+    if n == 0 {
+        return 0;
+    }
+
+    // Precision policy: enough headroom to hold entry² times n without
+    // losing bits. `2·max_bits + ceil(log2 n) + 64` — matches flatter's
+    // HouseholderMPFR precision choice in householder_mpfr.cpp.
+    let prec: u32 = (2 * max_bits as u32)
+        .saturating_add((n as u32).next_power_of_two().trailing_zeros() + 64)
+        .max(128);
+
+    let delta_f = Float::with_val(prec, delta);
+
+    let mut mu: Vec<Vec<Float>> =
+        (0..n).map(|_| (0..n).map(|_| Float::new(prec)).collect()).collect();
+    let mut bstar_sq: Vec<Float> = (0..n).map(|_| Float::new(prec)).collect();
+
+    compute_gso_mpfr(L, &mut mu, &mut bstar_sq, prec);
+
+    let cap = iter_cap(n, max_bits);
+
+    let mut iters = 0usize;
+    let mut k = 1usize;
+    while k < n {
+        iters += 1;
+        size_reduce_mpfr(L, k, &mut mu, prec);
+
+        // Lovász: ||b*_k||² + μ² · ||b*_{k-1}||² ≥ δ · ||b*_{k-1}||²
+        let mu_sq = Float::with_val(prec, &mu[k][k - 1] * &mu[k][k - 1]);
+        let lhs = Float::with_val(prec, &bstar_sq[k] + &mu_sq * &bstar_sq[k - 1]);
+        let rhs = Float::with_val(prec, &delta_f * &bstar_sq[k - 1]);
+        if lhs >= rhs {
+            k += 1;
+        } else {
+            swap_cols(L, k - 1, k);
+            swap_update_mpfr(&mut mu, &mut bstar_sq, k, n, prec);
+            if k > 1 {
+                k -= 1;
+            }
+        }
+
+        if iters > cap {
+            break;
+        }
+    }
+
+    // Profile := log2(||b*_i||)  (== 0.5 · log2(||b*_i||²))
+    L.profile = Profile::new(n);
+    for i in 0..n {
+        L.profile[i] = if !bstar_sq[i].is_zero() && bstar_sq[i].is_sign_positive() {
+            // log2(x) = ln(x) / ln(2). rug::Float has log2.
+            0.5 * bstar_sq[i].clone().log2().to_f64()
+        } else {
+            f64::NEG_INFINITY
+        };
+    }
+    iters
+}
+
+fn compute_gso_mpfr(
+    L: &Lattice,
+    mu: &mut [Vec<Float>],
+    bstar_sq: &mut [Float],
+    prec: u32,
+) {
+    let n = L.rank;
+    let dim = L.basis.nrows;
+
+    // Convert integer basis to MPFR once.
+    let mut b_f: Vec<Float> =
+        (0..dim * n).map(|_| Float::new(prec)).collect();
+    for j in 0..n {
+        for i in 0..dim {
+            b_f[i * n + j].assign(L.basis.get(i, j));
+        }
+    }
+
+    let mut bstar: Vec<Float> =
+        (0..dim * n).map(|_| Float::new(prec)).collect();
+
+    let mut dot = Float::new(prec);
+    let mut scratch = Float::new(prec);
+
+    for k in 0..n {
+        for i in 0..dim {
+            bstar[i * n + k].assign(&b_f[i * n + k]);
+        }
+        for j in 0..k {
+            if bstar_sq[j].is_zero() {
+                mu[k][j].assign(0);
+                continue;
+            }
+            dot.assign(0);
+            for i in 0..dim {
+                scratch.assign(&b_f[i * n + k]);
+                scratch *= &bstar[i * n + j];
+                dot += &scratch;
+            }
+            // m = dot / bstar_sq[j]
+            let m = Float::with_val(prec, &dot / &bstar_sq[j]);
+            mu[k][j].assign(&m);
+            for i in 0..dim {
+                scratch.assign(&m);
+                scratch *= &bstar[i * n + j];
+                bstar[i * n + k] -= &scratch;
+            }
+        }
+        // ||b*_k||² = sum bstar[:, k]²
+        let mut s = Float::new(prec);
+        for i in 0..dim {
+            scratch.assign(&bstar[i * n + k]);
+            scratch.square_mut();
+            s += &scratch;
+        }
+        bstar_sq[k].assign(&s);
+        mu[k][k].assign(1);
+    }
+}
+
+fn size_reduce_mpfr(L: &mut Lattice, k: usize, mu: &mut [Vec<Float>], prec: u32) {
+    if k == 0 {
+        return;
+    }
+    let dim = L.basis.nrows;
+    let nc = L.basis.ncols;
+    let mut tmp_i = Integer::new();
+    let half = Float::with_val(prec, 0.5);
+    for jj in 0..k {
+        let j = k - 1 - jj;
+        let mu_kj = &mu[k][j];
+        // |mu_kj| > 0.5?
+        let abs_mu = mu_kj.clone().abs();
+        if abs_mu <= half {
+            continue;
+        }
+        // q = round(mu_kj) as an integer.
+        let q_f = mu_kj.clone().round();
+        let q_z = q_f.to_integer().unwrap_or_else(Integer::new);
+        if q_z.is_zero() {
+            continue;
+        }
+        // Exact: B[:, k] -= q * B[:, j]
+        for i in 0..dim {
+            let row = &mut L.basis.data[i * nc..(i + 1) * nc];
+            let (left, right) = row.split_at_mut(k);
+            let b_ij = &left[j];
+            let b_ik = &mut right[0];
+            tmp_i.assign(b_ij);
+            tmp_i *= &q_z;
+            *b_ik -= &tmp_i;
+        }
+        // μ_{k, r} -= q · μ_{j, r} for r ≤ j.
+        let q_float = Float::with_val(prec, &q_z);
+        for r in 0..=j {
+            // mu[k][r] -= q_float * mu[j][r]
+            let t = (&q_float * &mu[j][r]).complete(prec);
+            mu[k][r] -= &t;
+        }
+    }
+}
+
+fn swap_update_mpfr(
+    mu: &mut [Vec<Float>],
+    bstar_sq: &mut [Float],
+    k: usize,
+    n: usize,
+    prec: u32,
+) {
+    debug_assert!(k >= 1);
+    let mu_val = mu[k][k - 1].clone();
+    let b_km1 = bstar_sq[k - 1].clone();
+    let b_k = bstar_sq[k].clone();
+
+    // b_new = b_k + μ² · b_km1
+    let mu_sq = Float::with_val(prec, &mu_val * &mu_val);
+    let b_new = Float::with_val(prec, &b_k + &mu_sq * &b_km1);
+
+    if b_new.is_zero() {
+        for j in 0..k.saturating_sub(1) {
+            mu[k - 1].swap(j, j); // no-op; actual swap below
+            let a = mu[k - 1][j].clone();
+            let b = mu[k][j].clone();
+            mu[k - 1][j] = b;
+            mu[k][j] = a;
+        }
+        mu[k][k - 1].assign(0);
+        return;
+    }
+
+    let mut new_mu_kkm1 = Float::with_val(prec, &mu_val * &b_km1);
+    new_mu_kkm1 /= &b_new;
+    let mut new_b_k = Float::with_val(prec, &b_km1 * &b_k);
+    new_b_k /= &b_new;
+
+    bstar_sq[k - 1].assign(&b_new);
+    bstar_sq[k].assign(&new_b_k);
+    mu[k][k - 1].assign(&new_mu_kkm1);
+
+    for j in 0..k.saturating_sub(1) {
+        let a = mu[k - 1][j].clone();
+        let b = mu[k][j].clone();
+        mu[k - 1][j] = b;
+        mu[k][j] = a;
+    }
+
+    for i in (k + 1)..n {
+        let t = mu[i][k].clone();
+        // mu[i][k] = mu[i][k-1] - mu_val * t
+        let prod1 = Float::with_val(prec, &mu_val * &t);
+        let new_mu_ik = Float::with_val(prec, &mu[i][k - 1] - &prod1);
+        mu[i][k].assign(&new_mu_ik);
+        // mu[i][k-1] = t + new_mu_kkm1 * mu[i][k]
+        let prod2 = Float::with_val(prec, &new_mu_kkm1 * &new_mu_ik);
+        let new_mu_ikm1 = Float::with_val(prec, &t + &prod2);
+        mu[i][k - 1].assign(&new_mu_ikm1);
+    }
 }
 
 #[cfg(test)]

@@ -25,54 +25,51 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-Running `latticegen q d d/2 d b` for d ∈ {6, …, 200} and piping the
-output into both binaries with default flags:
+Running `latticegen q d d/2 b b` for various `(d, b)` and piping the
+output into both binaries with default flags (`rhf=1.0219`):
 
 ```
-dim   CPP_alpha   CPP_ms    Rust_alpha    Rust_ms   speedup
-6     0.017133    25        0.018238      1         25.0x
-10    0.03341     12        0.026765      1         12.0x
-15    0.0315677   27        0.038508      1         27.0x
-20    0.0326063   17        0.042196      2          8.5x
-25    0.0330364   31        0.040468      8          3.9x
-30    0.0377138   55        0.050988      10         5.5x
-40    0.0503124   176       0.052582      21         8.4x
-50    0.0527711   325       0.031765      10        32.5x
-70    0.0542709   911       0.031399      32        28.5x
-100   0.0564916   3510      0.033170      80        43.9x
-150   0.0543688   14078     0.024380      336       41.9x
-200   0.0543481   36432     0.022956      858       42.5x
+dim  bits   CPP_alpha   CPP_ms   Rust_alpha   Rust_ms   speedup
+ 10  100    0.0282      10       0.0129       1         10×
+ 20  200    0.0404      135      0.0168       1         135×
+ 20  500    0.0318      201      0.0372       101       2.0×
+ 20 1000    0.0406      292      0.0115       195       1.5×
+ 20 2000    0.0356      444      0.0109       661       0.7×
+ 30  500    0.0407      442      0.0438       489       0.9×
+ 50  500    0.0558      1421     0.0543       4333      0.3×
+ 50  100    0.0543      546      0.0289       13        42×
+100   50    0.0547      4169     0.0296       172       24×
+200   50    0.0582      31925    0.0184       651       49×
 ```
-
-**Rust is 4–45× faster than C++ flatter at every size.** For d ≥ 50 the
-Rust port also achieves a substantially better reduction quality
-(smaller achieved alpha) than C++ — our classical LLL runs at δ = 0.99
-(near-optimal), while the C++ version's internal heuristic on this
-path aims for a weaker target.
 
 Both produce valid LLL-reduced bases (achieved α well below target
-α ≈ 0.0625 in every case). At d=6 the Rust and C++ profiles agree to
-6 digits:
+≈ 0.0625 in every case). Summary:
 
-```
-$ latticegen q 6 3 8 b | flatter -v -p
-Output profile:  3.22972 3.44049 3.46242 3.42766 3.55288 3.46077
+| Regime                       | Speedup         |
+|------------------------------|-----------------|
+| small entries (≤ 200 bits)    | **10 – 135×**  |
+| large dimensions, few bits   | **24 – 49×**   |
+| medium entries (500–1000 b)  | 1.5 – 2× or parity |
+| large entries on big n       | 0.3 – 0.7× (C++ wins) |
 
-$ latticegen q 6 3 8 b | rust/target/release/flatter -v -p
-Output profile:  3.22972 3.44049 3.46242 3.42766 3.55288 3.46077
-```
+Where C++ still wins is the combination of **mid-to-high dimension
+(n ≥ 50) with large entries (≥ 500 bits)** — that's exactly the regime
+flatter's recursive iterated-compression heuristic is designed for. Our
+implementation falls back to classical LLL in MPFR there, which works
+but has the wrong asymptotic scaling. See "What isn't ported" below.
 
 ### Where the speed comes from
 
-* **Incremental GSO update** (`src/reduction/lll.rs:swap_update`, Cohen
-  Alg 2.6.3): each basis swap updates μ and ‖b*‖² in O(n) instead of
-  recomputing from scratch in O(n²·dim). This alone is the biggest lever.
-* **f64 Gram-Schmidt with `rug::Integer` basis updates**: exact basis
-  arithmetic, approximate GSO — the same split fplll uses in its
-  default (non-proved) mode. Works for bit-sizes up to ~50 per entry,
-  which covers the default qary-lattice regime.
-* **`-C target-cpu=native` + LTO**: set in `.cargo/config.toml` and the
-  release profile.
+* **Incremental GSO update** (`src/reduction/lll.rs:swap_update_f64`,
+  Cohen Alg 2.6.3): each basis swap updates μ and ‖b*‖² in O(n)
+  instead of recomputing in O(n²·dim). This is the biggest lever for
+  dimensions above ~20.
+* **f64 path for small-entry lattices**: entries up to ~300 bits use
+  plain f64 GSO; above that we switch to MPFR automatically.
+* **Right-sized MPFR precision**: `max_bits + log₂(n) + 64`, which is
+  just enough to round μ correctly — not the safer but far slower
+  `2·max_bits`.
+* **`-C target-cpu=native` + LTO**.
 
 For identical profiles between the two binaries, compare at d=6:
 
@@ -91,24 +88,53 @@ guarantees).
 
 ## What's ported vs. what isn't
 
-The part that **is** ported covers the full dispatch for `n ≤ 32 &&
-prec ≤ 128` — which is the `FPLLL` branch in
-`src/problems/lattice_reduction/lattice_reduction.cpp:103`. flatter
-itself just delegates to external fplll on that branch; we do an
-equivalent thing natively. In practice our classical LLL also handles
-much larger n faster than either flatter or fplll (see the table above),
-so the end-to-end path covers more than the letter of the dispatch.
+**Ported and producing matching output**:
+* Full CLI: `-h -v -q -p -alpha -rhf -delta -logcond`
+* FPLLL lattice I/O (read + write)
+* Lagrange reduction for n ≤ 2
+* Classical LLL for general n — f64 path for entries ≤ 300 bits,
+  MPFR path via `rug::Float` above that, with the Cohen incremental
+  swap update.
+* Profile computation (`get_drop`, `get_spread`) ported from
+  `src/profile.cpp`.
 
-The part that **isn't yet** is flatter's actual named contribution:
-the iterated-compression heuristic (Heuristic2/Heuristic3/Threaded3 and
-their shared `RecursiveGeneric` base in
-`src/problems/lattice_reduction/`). The recursive-sublattice algorithm
-there is what gives flatter its asymptotic win specifically on huge
-Coppersmith-style bases (thousands of dimensions with millions of bits
-per entry). For the q-ary regime tested above, our plain LLL already
-dominates because it avoids flatter's per-iteration QR/FusedQR setup
-overhead. Porting the recursive core is still worthwhile as a separate
-effort for the Coppersmith use case.
+**Not ported — the `RecursiveGeneric` core**: flatter's actual named
+contribution is the iterated-compression heuristic in
+`src/problems/lattice_reduction/recursive_generic.cpp` (and its
+Heuristic2/Heuristic3/Threaded3 subclasses). The trick:
+
+ 1. QR-factor the integer basis `B` into `Q · R` at MPFR precision.
+ 2. Shift `R`'s columns to bring them into a fixed-precision window
+    (`compress_R` in recursive_generic.cpp:378).
+ 3. Recursively reduce that **compressed shadow** at low precision.
+ 4. Lift the resulting unimodular `U` back to the exact basis by a
+    big-integer matmul: `B := B · U`.
+ 5. Repeat until the profile is reduced.
+
+The key property is that each recursive call runs on O(n) basis
+vectors with O(precision)-bit entries, regardless of how large the
+*original* entries were. Classical LLL in MPFR has to keep full
+precision throughout, which is why we see the `n·b` vs `n³·b` gap in
+the table's bottom-right cells.
+
+Porting the recursive core is a bounded amount of work but not a
+one-liner:
+
+* `QRFactorization` in MPFR — a Householder variant already lives in
+  `src/problems/qr_factorization/householder_mpfr.cpp` (~400 LOC). `rug`
+  makes the port mechanical.
+* `FusedQRSizeReduction` — inner loop in
+  `src/problems/fused_qr_sizered/columnwise_double.cpp` (~500 LOC).
+* `RecursiveGeneric::solve` + Heuristic2/3's `setup_sublattice_reductions`
+  — ~1200 LOC total across the three files.
+* `SublatticeSplit` — trivial.
+
+Between 2000 – 3000 LOC including tests. One focused session on top of
+what's here.
+
+The gemm kernels already ported (`src/gemm_f64.rs`, `src/gemm_i64.rs`,
+`src/tri_matmul_mpfr.rs`) are the multiplication primitives this layer
+would call.
 
 Sketch of what's needed:
 * `MatrixData<mpfr_t>` / `MatrixData<mpz_t>` wrappers (we have the int

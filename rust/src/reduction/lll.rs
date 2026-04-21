@@ -15,7 +15,7 @@
 
 use rug::{ops::CompleteRound, Assign, Float, Integer};
 
-use crate::lattice::Lattice;
+use crate::lattice::{IntMatrix, Lattice};
 use crate::profile::Profile;
 use crate::reduction::params::LatticeReductionParams;
 
@@ -29,14 +29,14 @@ use crate::reduction::params::LatticeReductionParams;
 /// (which lose relative precision proportional to `bits`), we cap at a
 /// tight 300 bits. Above this, the MPFR path runs and is correct up to
 /// arbitrary precision.
-const F64_MAX_BITS: u64 = 300;
+pub(crate) const F64_MAX_BITS: u64 = 300;
 
 /// Run LLL in-place on `L` and set `L.profile`. Returns the number of
 /// outer iterations for logging.
 pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     let max_bits = max_entry_bits(L);
     if max_bits <= F64_MAX_BITS {
-        reduce_f64(L, params)
+        reduce_f64(L, params, None)
     } else {
         reduce_mpfr(L, params, max_bits)
     }
@@ -69,11 +69,19 @@ fn iter_cap(n: usize, max_bits: u64) -> usize {
 // f64 path
 // ---------------------------------------------------------------------------
 
-fn reduce_f64(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
+pub(crate) fn reduce_f64(
+    L: &mut Lattice,
+    params: &LatticeReductionParams,
+    mut track_u: Option<&mut IntMatrix>,
+) -> usize {
     let n = L.rank;
     let delta = params.delta;
     if n == 0 {
         return 0;
+    }
+
+    if let Some(ref mut u) = track_u {
+        set_identity(u);
     }
 
     let mut mu = vec![vec![0.0f64; n]; n];
@@ -81,15 +89,13 @@ fn reduce_f64(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
 
     compute_gso_f64(L, &mut mu, &mut bstar_sq);
 
-    // Iteration cap scales with the initial log-determinant: LLL is
-    // guaranteed to converge in O(n² · log₁/δ(det)) swaps.
     let cap = iter_cap(n, max_entry_bits(L));
 
     let mut iters = 0usize;
     let mut k = 1usize;
     while k < n {
         iters += 1;
-        size_reduce_f64(L, k, &mut mu);
+        size_reduce_f64(L, k, &mut mu, track_u.as_deref_mut());
 
         let ok = bstar_sq[k] + mu[k][k - 1].powi(2) * bstar_sq[k - 1]
             >= delta * bstar_sq[k - 1];
@@ -97,6 +103,9 @@ fn reduce_f64(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
             k += 1;
         } else {
             swap_cols(L, k - 1, k);
+            if let Some(ref mut u) = track_u {
+                swap_cols_in(u, k - 1, k);
+            }
             swap_update_f64(&mut mu, &mut bstar_sq, k, n);
             if k > 1 {
                 k -= 1;
@@ -183,19 +192,33 @@ fn swap_update_f64(mu: &mut [Vec<f64>], bstar_sq: &mut [f64], k: usize, n: usize
 
 /// Integer column swap: `col(a) <-> col(b)` in `L.basis`.
 fn swap_cols(L: &mut Lattice, a: usize, b: usize) {
+    swap_cols_in(&mut L.basis, a, b);
+}
+fn swap_cols_in(M: &mut IntMatrix, a: usize, b: usize) {
     if a == b {
         return;
     }
-    let nc = L.basis.ncols;
-    for i in 0..L.basis.nrows {
-        L.basis.data.swap(i * nc + a, i * nc + b);
+    let nc = M.ncols;
+    for i in 0..M.nrows {
+        M.data.swap(i * nc + a, i * nc + b);
+    }
+}
+fn set_identity(M: &mut IntMatrix) {
+    for i in 0..M.nrows {
+        for j in 0..M.ncols {
+            M.data[i * M.ncols + j] = Integer::from(if i == j { 1 } else { 0 });
+        }
     }
 }
 
-/// Size reduction of column `k` against columns `0..k`. Updates the
-/// Gram-Schmidt coefficients in `mu` to match. After this, every
-/// `mu[k][j]` for `j < k` satisfies `|mu[k][j]| <= 1/2`.
-fn size_reduce_f64(L: &mut Lattice, k: usize, mu: &mut [Vec<f64>]) {
+/// Size reduction of column `k` against columns `0..k`. Updates μ to
+/// match, and if `u` is supplied, mirrors the column operations on it.
+fn size_reduce_f64(
+    L: &mut Lattice,
+    k: usize,
+    mu: &mut [Vec<f64>],
+    mut u: Option<&mut IntMatrix>,
+) {
     if k == 0 {
         return;
     }
@@ -213,17 +236,24 @@ fn size_reduce_f64(L: &mut Lattice, k: usize, mu: &mut [Vec<f64>]) {
         q_z.assign(q as i64);
         for i in 0..dim {
             let row = &mut L.basis.data[i * nc..(i + 1) * nc];
-            let (b_ij, b_ik) = {
-                let (left, right) = row.split_at_mut(k);
-                if j < k {
-                    (&left[j], &mut right[0])
-                } else {
-                    unreachable!()
-                }
-            };
+            let (left, right) = row.split_at_mut(k);
+            let b_ij = &left[j];
+            let b_ik = &mut right[0];
             tmp.assign(b_ij);
             tmp *= &q_z;
             *b_ik -= &tmp;
+        }
+        if let Some(u_mat) = u.as_deref_mut() {
+            let u_nc = u_mat.ncols;
+            for i in 0..u_mat.nrows {
+                let row = &mut u_mat.data[i * u_nc..(i + 1) * u_nc];
+                let (left, right) = row.split_at_mut(k);
+                let u_ij = &left[j];
+                let u_ik = &mut right[0];
+                tmp.assign(u_ij);
+                tmp *= &q_z;
+                *u_ik -= &tmp;
+            }
         }
         for r in 0..=j {
             mu[k][r] -= q * mu[j][r];
@@ -287,10 +317,13 @@ fn reduce_mpfr(L: &mut Lattice, params: &LatticeReductionParams, max_bits: u64) 
         return 0;
     }
 
-    // Precision policy: enough headroom to hold entry² times n without
-    // losing bits. `2·max_bits + ceil(log2 n) + 64` — matches flatter's
-    // HouseholderMPFR precision choice in householder_mpfr.cpp.
-    let prec: u32 = (2 * max_bits as u32)
+    // Precision policy: μ = <b_k, b*_j> / ||b*_j||² is O(1) and we need
+    // absolute precision ≪ 0.5 in μ for `round(μ)` to be exact. The dot
+    // product has magnitude up to ~2^max_bits, so relative precision of
+    // `max_bits + log2(n) + 64` bits gives us `2^64` bits of slack in μ.
+    // Much tighter than `2·max_bits` which produced far more precision
+    // than the algorithm actually uses.
+    let prec: u32 = (max_bits as u32)
         .saturating_add((n as u32).next_power_of_two().trailing_zeros() + 64)
         .max(128);
 

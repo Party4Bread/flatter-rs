@@ -48,20 +48,19 @@ pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     // outperforms classical LLL once `n` is large enough to amortize
     // the per-round QR/compress overhead. For small `n`, stay with
     // classical MPFR LLL.
-    if L.rank >= HEURISTIC2_MIN_N {
-        // Pre-triangularize: Heuristic2::init_compressed_B reads the
-        // basis diagonal assuming upper-triangular, which q-ary
-        // inputs aren't. Flatter's CondUnknown stage does this in
-        // C++ (src/problems/lattice_reduction/cond_unknown.cpp:289).
-        pre_triangularize(L);
-        let h2_lattice = L.basis.clone();
-        let mut h2 = crate::reduction::heuristic2::Heuristic2::new(h2_lattice, params.clone());
-        let (profile, iters) = h2.solve();
-        L.basis = std::mem::take(&mut h2.base.outer_m);
-        L.profile = profile;
-        return iters;
-    }
-
+    // Without a faithful CondUnknown pre-pass, Heuristic2 alone
+    // produces a valid-but-loose reduction (α ≈ 0.05 vs. C++'s 0.03
+    // direct). Since MPFR LLL is already several-× faster than C++
+    // on the 1024-bit regime, route big-entry inputs straight to it
+    // rather than running Heuristic2 and then polishing with MPFR
+    // LLL anyway (which was the honest version of what the previous
+    // commit did).
+    //
+    // The `heuristic2.rs` port still ships — it's a real port of the
+    // three update paths + RelativeSizeReduction::Triangular — but
+    // dispatch routes through MPFR LLL until CondUnknown lands to
+    // set Heuristic2 up with a properly-triangularized, already
+    // loosely-reduced input.
     reduce_mpfr(L, params, max_bits)
 }
 

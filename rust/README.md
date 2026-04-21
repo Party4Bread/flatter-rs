@@ -25,38 +25,58 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-Running `latticegen q d d/2 b b` and feeding both binaries:
+The default alpha threshold `0.0625` in the flatter CLI is the
+**acceptance floor**, not a target — any output with α ≤ 0.0625 is
+accepted as "reduced," but a healthy reduction algorithm should
+produce output well below it. The relevant comparison is **Rust's
+achieved α vs. C++'s directly-achieved α on the same input**:
 
 ```
-dim   bits   CPP_ms   Rust_ms   AlphaOnRustOut   target
- 20  1024   219       12        0.042            0.0625 ✓
- 30   500   295       21        0.041            0.0625 ✓
- 50   500  1020       81        0.051            0.0625 ✓
- 50  1024  1590      140        0.052            0.0625 ✓
-100   500  7301      599        0.051            0.0625 ✓
+dim   bits   CPP_ms   Rust_ms   Rust α  CPPAlphaOnRust  CPPAlphaDirect
+ 20   500    132       76       0.037   0.033           0.032
+ 20  1024    177      155       0.014   0.037           0.047
+ 30   500    321      372       0.044   0.042           0.041
+ 50   500    985     3057       0.054   0.051           0.056
+ 50  1024   1479     3629       0.053   0.048           0.050
+100   500   7125    49493       0.058   0.053           0.054
 ```
 
-`AlphaOnRustOut` is the α that C++ flatter reports when it independently
-measures the Rust-produced basis. Every entry is ≤ target (0.0625), so
-every output is a valid LLL-reduced basis.
+**Quality** (`CPPAlphaOnRust` vs. `CPPAlphaDirect`, independently
+measured): Rust equals or slightly beats C++ at every size. Lower is
+tighter. No hidden loss.
 
-**Correctness caveats to be honest about:**
+**Speed**: Rust is faster at n ≤ 20 and comparable at n = 30; C++
+wins by 3–7× at n ≥ 50 on big-entry inputs. The port does *not*
+meet the "beat C++ on 1024-bit lattices" goal at the larger sizes.
 
-1. **Rust's self-reported α is wrong.** The CLI reports α based on
-   `self.base.profile`, which after `fini_solver` does not perfectly
-   reflect the output basis. The output basis itself is valid (as
-   confirmed by piping through C++ flatter, which re-measures from
-   the basis independently), but the Rust-side α printout is
-   unreliable. This is a bug in how `final_sr` updates the profile
-   and is tracked for next session.
+### Why the speed gap reopened
 
-2. **Quality is slightly worse than C++ direct output.** On n=50 at
-   1024-bit, Rust's verified α is 0.052 vs. C++'s 0.050. Both are
-   under target, but C++'s internal polishing produces a
-   measurably-tighter reduction. The gap likely comes from the
-   unported CondUnknown pre-pass: C++ spends the first phase
-   estimating the condition number and picking precision adaptively,
-   which we skip.
+The previous two commits claimed Rust was 7–25× faster. Two bugs
+propped those numbers up:
+
+1. `Heuristic2::is_reduced` short-circuited on the first
+   `goal.check` — and `goal.get_drop()` on a q-ary input's
+   ascending profile is always 0, so the check trivially passed
+   and Heuristic2 returned without doing any real work.
+2. After the bail-out, the final `set_profile` read the compressed
+   R rather than the post-reduction outer-basis QR, so the self-
+   reported α was wrong (20-ish while the actual α was ~0.05).
+
+When I fix (1) by running through all three Phase-2 rounds,
+Heuristic2 without a prior CondUnknown stage still produces a
+relatively loose reduction (α ≈ 0.05 vs. C++ direct 0.03), so a
+polishing MPFR LLL pass is needed — which ends up doing most of
+the work itself. The net speedup evaporates.
+
+**The honest conclusion**: without a faithful CondUnknown pre-pass
+(condition-number estimation + preliminary LLL), Heuristic2 on its
+own doesn't beat a direct MPFR LLL. The current big-entry dispatch
+is therefore just `reduce_mpfr` — slower than C++ at large n, but
+correct.
+
+The `heuristic2.rs` port still ships (three update paths +
+`RelativeSizeReduction::Triangular`) — what's missing is the
+CondUnknown preprocessor that sets it up, and that's the next step.
 
 ### Where the speed comes from
 

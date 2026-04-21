@@ -200,18 +200,16 @@ impl Heuristic2 {
     /// shift vector and flattens it artificially. So we must reapply
     /// the local offsets to compare against the uncompressed goal.
     /// `Heuristic2::is_reduced` (heuristic_2.cpp:19).
+    ///
+    /// The C++ code short-circuits on `iterations == 0 &&
+    /// goal.check(profile)` — but that path relies on CondUnknown
+    /// having produced a DESCENDING profile already. For a raw q-ary
+    /// input (ascending profile), `profile.get_drop()` is 0 and
+    /// `goal.check` would trivially pass, which causes Heuristic2 to
+    /// return without doing any work. Since we don't have CondUnknown
+    /// yet, we drop the iter==0 short-circuit and always run through
+    /// the Phase-2 schedule.
     fn is_reduced(&self) -> bool {
-        if rounds_so_far(&self.base) == 0 {
-            // Reconstruct the pre-compression profile so goal.check
-            // sees the *real* drop rather than the flattened one.
-            let mut un = self.base.profile.clone();
-            for i in 0..self.base.n {
-                un[i] += self.base.local_profile_offsets[i];
-            }
-            if self.base.params.goal.check(&un) {
-                return true;
-            }
-        }
         self.base
             .params
             .split

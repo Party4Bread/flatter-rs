@@ -180,7 +180,7 @@ fn run() -> Result<(), String> {
         );
     }
 
-    let goal = LatticeReductionGoal::from_slope(L.rank, args.alpha);
+    let goal = LatticeReductionGoal::from_slope(L.rank, args.alpha, false);
     let mut params = LatticeReductionParams::from_goal(goal);
     if args.logcond_set {
         params.log_cond = args.logcond;

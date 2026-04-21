@@ -547,7 +547,7 @@ mod tests {
     use rug::Integer;
 
     fn params(n: usize) -> LatticeReductionParams {
-        LatticeReductionParams::from_goal(LatticeReductionGoal::from_rhf(n, 1.0219))
+        LatticeReductionParams::from_goal(LatticeReductionGoal::from_rhf(n, 1.0219, false))
     }
 
     #[test]

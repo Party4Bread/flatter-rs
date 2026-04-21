@@ -7,6 +7,7 @@ pub mod heuristic;
 pub mod lagrange;
 pub mod lll;
 pub mod params;
+pub mod sublattice_split;
 
 pub use goal::LatticeReductionGoal;
 pub use params::LatticeReductionParams;

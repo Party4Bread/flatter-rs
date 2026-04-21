@@ -53,6 +53,61 @@ impl IntMatrix {
         }
         true
     }
+
+    /// True iff `self` is the identity (square, 1s on diag, 0s off).
+    pub fn is_identity(&self) -> bool {
+        if self.nrows != self.ncols {
+            return false;
+        }
+        for i in 0..self.nrows {
+            for j in 0..self.ncols {
+                let v = self.get(i, j);
+                if i == j {
+                    if v.to_i64() != Some(1) {
+                        return false;
+                    }
+                } else if !v.is_zero() {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Overwrite with the identity matrix. Panics unless square.
+    pub fn set_identity(&mut self) {
+        assert_eq!(self.nrows, self.ncols);
+        for i in 0..self.nrows {
+            for j in 0..self.ncols {
+                self.set(i, j, Integer::from(if i == j { 1 } else { 0 }));
+            }
+        }
+    }
+
+    /// Copy the submatrix `[i0..i1, j0..j1]` out as a new owned matrix.
+    /// Mirrors `Matrix::submatrix` in the C++ layer.
+    pub fn submatrix(&self, i0: usize, i1: usize, j0: usize, j1: usize) -> IntMatrix {
+        assert!(i0 <= i1 && i1 <= self.nrows);
+        assert!(j0 <= j1 && j1 <= self.ncols);
+        let mut out = IntMatrix::zeros(i1 - i0, j1 - j0);
+        for i in 0..(i1 - i0) {
+            for j in 0..(j1 - j0) {
+                out.set(i, j, self.get(i0 + i, j0 + j).clone());
+            }
+        }
+        out
+    }
+
+    /// Write `src` into `self` at offset `(i0, j0)`.
+    pub fn copy_submatrix_from(&mut self, i0: usize, j0: usize, src: &IntMatrix) {
+        assert!(i0 + src.nrows <= self.nrows);
+        assert!(j0 + src.ncols <= self.ncols);
+        for i in 0..src.nrows {
+            for j in 0..src.ncols {
+                self.set(i0 + i, j0 + j, src.get(i, j).clone());
+            }
+        }
+    }
 }
 
 /// Port of `flatter::Lattice`.

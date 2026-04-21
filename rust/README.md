@@ -25,38 +25,34 @@ crate (feature `use-system-libs` so the build reuses the system
 
 ## End-to-end comparison with C++ flatter
 
-Running `latticegen q d d/2 b b` for various `(d, b)` and piping the
-output into both binaries with default flags (`rhf=1.0219`):
+After porting flatter's iterated-compression core (Heuristic2 +
+RecursiveGeneric + Householder QR + FusedQRSizeReduction):
 
 ```
-dim  bits   CPP_alpha   CPP_ms   Rust_alpha   Rust_ms   speedup
- 10  100    0.0282      10       0.0129       1         10×
- 20  200    0.0404      135      0.0168       1         135×
- 20  500    0.0318      201      0.0372       101       2.0×
- 20 1000    0.0406      292      0.0115       195       1.5×
- 20 2000    0.0356      444      0.0109       661       0.7×
- 30  500    0.0407      442      0.0438       489       0.9×
- 50  500    0.0558      1421     0.0543       4333      0.3×
- 50  100    0.0543      546      0.0289       13        42×
-100   50    0.0547      4169     0.0296       172       24×
-200   50    0.0582      31925    0.0184       651       49×
+dim   bits   CPP_ms   Rust_ms   speedup   AlphaOnRustOut   target
+ 10   100   12       <1                   0.028            0.0625
+ 20   200   91       <1                   0.032            0.0625
+ 20   500   155      11        14.1×      0.037            0.0625
+ 20  1024   168      18         9.3×      0.042            0.0625
+ 20  2048   318      36         8.8×      0.037            0.0625
+ 30   500   330      35         9.4×      0.041            0.0625
+ 50   500  1160     156         7.4×      0.051            0.0625
+ 50  1024  1790     254         7.0×      0.052            0.0625
+100    50  3536     143        24.7×      0.051            0.0625
+100   500  8959    1099         8.2×      0.051            0.0625
 ```
 
-Both produce valid LLL-reduced bases (achieved α well below target
-≈ 0.0625 in every case). Summary:
+`AlphaOnRustOut` is the achieved-alpha that C++ flatter reports when
+fed the Rust output — it's the independent quality check. Every entry
+is ≤ target 0.0625, so all reductions are correct. At every tested
+point **Rust is faster than C++**, by 7–25× in the big-entry regime
+(including 1024-bit, the primary target), and equal-or-faster elsewhere.
 
-| Regime                       | Speedup         |
-|------------------------------|-----------------|
-| small entries (≤ 200 bits)    | **10 – 135×**  |
-| large dimensions, few bits   | **24 – 49×**   |
-| medium entries (500–1000 b)  | 1.5 – 2× or parity |
-| large entries on big n       | 0.3 – 0.7× (C++ wins) |
-
-Where C++ still wins is the combination of **mid-to-high dimension
-(n ≥ 50) with large entries (≥ 500 bits)** — that's exactly the regime
-flatter's recursive iterated-compression heuristic is designed for. Our
-implementation falls back to classical LLL in MPFR there, which works
-but has the wrong asymptotic scaling. See "What isn't ported" below.
+The tradeoff: Rust's immediate output is slightly less-reduced than
+C++'s (alpha 0.04–0.05 vs 0.03), because our `Heuristic2` runs at
+δ=0.99 and our size-reduction converges to a 0.51 tolerance without
+the extra polishing pass C++ does. Piping the Rust output through
+C++ again gives the C++-quality output in < 100 ms on every size.
 
 ### Where the speed comes from
 
@@ -98,77 +94,37 @@ guarantees).
 * Profile computation (`get_drop`, `get_spread`) ported from
   `src/profile.cpp`.
 
-**Building blocks of the recursive core — ported and unit-tested**:
+**Recursive iterated-compression core (Phase A–D)**:
 
 * `src/math/qr.rs` — Householder QR in MPFR (port of
-  `householder_mpfr.cpp`'s `larfg`/`larf`, without the block-reflector
-  optimization).
-* `src/math/size_reduce_r.rs` — size reduction given an integer basis
-  B and its MPFR R factor. Guarantees `|R[i,j]| ≤ |R[i,i]|/2` for all
-  `i < j` after the call.
-* `src/math/mat_mpfr.rs` — dense MPFR matrix with the minimal surface
-  QR + size-reduce-R need.
+  `householder_mpfr.cpp`).
+* `src/math/fused_qr_sr.rs` — port of `columnwise.cpp`'s fused
+  QR + size-reduction.
+* `src/math/size_reduce_r.rs` / `mat_mul.rs` / `mat_mpfr.rs` — the
+  supporting primitives.
+* `src/reduction/sublattice_split.rs` — Phase2 + Phase3 splitters.
+* `src/reduction/goal.rs` — full `LatticeReductionGoal` surface
+  (proved and heuristic).
+* `src/reduction/params.rs` — mirrors C++ `LatticeReductionParams`.
+* `src/reduction/recursive_generic.rs` — `init_solver`,
+  `compress_R`, `get_shifts_for_compression`, `collect_U` (the
+  D⁻¹·U_iter·D conjugation), `final_sr`.
+* `src/reduction/heuristic2.rs` — single-sublattice iterated
+  compression.
+* `src/reduction/lll.rs` — dispatch: small-n → Lagrange;
+  small-bit → f64 LLL; big-bit & n ≥ 20 → Heuristic2; otherwise
+  → MPFR LLL with U tracking.
 
-Tests confirm QR diagonals equal Gram-Schmidt norms, and size-reduce
-preserves the basis determinant while bounding off-diagonals of R.
+**Not yet ported** (tracked for follow-up sessions):
 
-**Not yet wired into dispatch — the recursive sublattice split**:
+* **B2 / Coppersmith secondary basis** — ~200 LOC of mirror paths
+  in `Heuristic2`.
+* **Heuristic3 + Threaded3** — tiled parallel reduction. ~700 LOC.
+* **CondUnknown / Irregular / Heuristic1 / Proved{1,2,3}** — the
+  initial-phase preprocessors and proven variants. ~1200 LOC.
+* **Full dispatch tree** from `lattice_reduction.cpp:58–132`.
 
-Flatter's `RecursiveGeneric::solve` (`src/problems/lattice_reduction/recursive_generic.cpp:409`)
-runs the loop:
-
- 1. QR-factor B → R (ported above).
- 2. Size-reduce R (ported above).
- 3. Compress R into a low-precision shadow. The shift formula
-    (`get_shifts_for_compression` at recursive_generic.cpp:333)
-    tracks the profile's *staircase* structure so that for q-ary
-    inputs (first-half diagonals ≫ second-half diagonals) the shifts
-    stay safe per column.
- 4. Recurse on the shadow via `LatticeReduction::solve` on a
-    sublattice window picked by `SublatticeSplit`.
- 5. Lift U back with a big-integer matmul.
- 6. Repeat.
-
-A prototype in `src/reduction/heuristic.rs` implements steps 1–3 and
-5 but with a *non-recursive* shadow LLL, which isn't enough for q-ary
-inputs: the compression keeps the precision the same (profile spread
-is unchanged), so the shadow LLL isn't any cheaper than the original.
-The recursive sublattice split is what actually halves precision per
-level — that's the missing piece.
-
-Remaining work (rough LOC):
-
-* `SublatticeSplit::get_sublattices` / `get_child_split` — ~150 LOC,
-  mechanical.
-* `Heuristic2::setup_sublattice_reductions` — ~150 LOC. Uses
-  `SublatticeSplit` to pick `[start..end]`, builds a sub-`Lattice`,
-  calls `reduce` recursively, collects U.
-* `Heuristic2::reduce_sublattices` / `update_representation` — ~200
-  LOC. Wires the recursion into the main loop, with matmul to apply
-  U to the global R and B.
-* End-to-end wiring and tests — ~200 LOC.
-
-~700 LOC total; one more focused session on top of what ships here.
-
-The gemm kernels already ported (`src/gemm_f64.rs`, `src/gemm_i64.rs`,
-`src/tri_matmul_mpfr.rs`) cover the multiplication primitives this
-layer needs.
-
-Sketch of what's needed:
-* `MatrixData<mpfr_t>` / `MatrixData<mpz_t>` wrappers (we have the int
-  matrix; the MPFR one is trivial on top of `Vec<rug::Float>`).
-* `QRFactorization` — Householder QR at MPFR precision. Bindings to
-  LAPACK via `lapack`/`openblas-src` work for the double-precision path,
-  `rug` handles MPFR.
-* `FusedQRSizeReduction` — the inner loop of the recursion. One file
-  (`src/problems/fused_qr_sizered/`).
-* `RecursiveGeneric` + `Heuristic2`/`Heuristic3` — the algorithm proper.
-* `SublatticeSplit` — trivial.
-* Rayon to replace the OpenMP tasks in `threaded_3.cpp`.
-
-The gemm kernels ported earlier in this directory
-(`gemm_f64.rs`, `gemm_i64.rs`) already cover the matrix-multiplication
-building blocks needed by that layer.
+27 unit tests passing (`cargo test --release`).
 
 ## Build
 

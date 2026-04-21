@@ -4,6 +4,7 @@
 
 pub mod goal;
 pub mod heuristic;
+pub mod heuristic2;
 pub mod lagrange;
 pub mod lll;
 pub mod params;

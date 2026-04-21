@@ -343,13 +343,25 @@ impl RecursiveGeneric {
 
     /// `recursive_generic.cpp:106`: one final fused QR + size reduction
     /// on the outer basis, at a tighter precision. Composes the returned
-    /// U into the global `self.u`.
+    /// U into the global `self.u` and updates `self.profile` to the
+    /// final, offset-free log₂|b*_i|.
     pub fn final_sr(&mut self) {
-        let spread = self.profile.get_spread();
-        let new_precision = self.get_precision_from_spread(spread);
-        self.set_precision(new_precision);
+        let max_bits_before = self
+            .outer_m
+            .data
+            .iter()
+            .map(|e| e.significant_bits() as u64)
+            .max()
+            .unwrap_or(0);
+        // Precision must cover both the *spread* between max and min
+        // R diagonals AND the dot-products involved in the Householder
+        // QR. A safe choice is `max_bits + log₂ n + 64` — same policy
+        // as the MPFR LLL path.
+        let prec_bits =
+            (max_bits_before as u32).saturating_add((self.n as u32).next_power_of_two().trailing_zeros() + 64).max(128);
+        self.set_precision(prec_bits);
 
-        let mut r_final = MatMpfr::zeros(self.m, self.n, new_precision);
+        let mut r_final = MatMpfr::zeros(self.m, self.n, prec_bits);
         let mut u_tmp = IntMatrix::zeros(self.n, self.n);
         fused_qr_sr::fused_qr_sr(&mut self.outer_m, &mut r_final, &mut u_tmp);
         self.r = r_final;
@@ -357,6 +369,11 @@ impl RecursiveGeneric {
         // U := U · U_tmp
         let new_u = mat_mul::mat_mul(&self.u, &u_tmp);
         self.u = new_u;
+
+        // Profile ← log₂|R_diag_i|. No offsets to apply; the outer M
+        // now reflects the fully-reduced basis.
+        self.set_profile();
+        let _ = max_bits_before;
     }
 
     /// `recursive_generic.cpp:147`: apply the accumulated U to the

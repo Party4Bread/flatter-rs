@@ -31,6 +31,11 @@ use crate::reduction::params::LatticeReductionParams;
 /// arbitrary precision.
 pub(crate) const F64_MAX_BITS: u64 = 300;
 
+/// Threshold on the number of basis vectors above which we route big-
+/// entry inputs through the Heuristic2 recursive compressor rather
+/// than classical MPFR LLL. Below this, plain MPFR LLL is competitive.
+pub(crate) const HEURISTIC2_MIN_N: usize = 20;
+
 /// Run LLL in-place on `L` and set `L.profile`. Returns the number of
 /// outer iterations for logging.
 pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
@@ -38,14 +43,65 @@ pub fn reduce(L: &mut Lattice, params: &LatticeReductionParams) -> usize {
     if max_bits <= F64_MAX_BITS {
         return reduce_f64(L, params, None);
     }
-    // For huge-entry lattices we use classical LLL in MPFR. A
-    // simplified iterated-compression prototype lives in
-    // `crate::reduction::heuristic` — it QR-factors the basis and
-    // size-reduces R as building blocks — but the shadow-lattice
-    // construction in that prototype doesn't converge for q-ary inputs
-    // (the profile is too spread). Flatter's real compression uses
-    // sublattice splitting, which is the remaining unported piece.
+
+    // Big-entry inputs: flatter's iterated-compression heuristic
+    // outperforms classical LLL once `n` is large enough to amortize
+    // the per-round QR/compress overhead. For small `n`, stay with
+    // classical MPFR LLL.
+    if L.rank >= HEURISTIC2_MIN_N {
+        // Pre-triangularize: Heuristic2::init_compressed_B reads the
+        // basis diagonal assuming upper-triangular, which q-ary
+        // inputs aren't. Flatter's CondUnknown stage does this in
+        // C++ (src/problems/lattice_reduction/cond_unknown.cpp:289).
+        pre_triangularize(L);
+        let h2_lattice = L.basis.clone();
+        let mut h2 = crate::reduction::heuristic2::Heuristic2::new(h2_lattice, params.clone());
+        let (profile, iters) = h2.solve();
+        L.basis = std::mem::take(&mut h2.base.outer_m);
+        L.profile = profile;
+        return iters;
+    }
+
     reduce_mpfr(L, params, max_bits)
+}
+
+/// Run one fused QR + size-reduction to get an upper-triangular
+/// integer basis. Applies the resulting unimodular to `L.basis` in
+/// place. Precision is set generously from the current max entry.
+fn pre_triangularize(L: &mut Lattice) {
+    let max_bits = max_entry_bits(L);
+    let n = L.rank;
+    let m = L.basis.nrows;
+    let prec =
+        ((max_bits as u32).saturating_add((n as u32).next_power_of_two().trailing_zeros() + 64))
+            .max(128);
+    let mut r = crate::math::mat_mpfr::MatMpfr::zeros(m, n, prec);
+    let mut u = IntMatrix::zeros(n, n);
+    crate::math::fused_qr_sr::fused_qr_sr(&mut L.basis, &mut r, &mut u);
+}
+
+/// Variant of `reduce` that also tracks the unimodular U such that
+/// `basis_out = basis_in · U`. Used internally by the recursive
+/// heuristic when it needs U for composing sub-reductions.
+pub fn reduce_with_u(L: &mut Lattice, params: &LatticeReductionParams, u: &mut IntMatrix) -> usize {
+    let max_bits = max_entry_bits(L);
+    if max_bits <= F64_MAX_BITS {
+        return reduce_f64(L, params, Some(u));
+    }
+    if L.rank >= HEURISTIC2_MIN_N {
+        let h2_lattice = L.basis.clone();
+        let mut h2 = crate::reduction::heuristic2::Heuristic2::new(h2_lattice, params.clone());
+        let (profile, iters) = h2.solve();
+        // Compose: U := U · h2.base.u  (the heuristic tracks an internal
+        // unimodular in base.u after fini_solver).
+        let composed = crate::math::mat_mul::mat_mul(u, &h2.base.u);
+        *u = composed;
+        L.basis = std::mem::take(&mut h2.base.outer_m);
+        L.profile = profile;
+        return iters;
+    }
+    // MPFR LLL with U tracking (for small-n, big-bits).
+    reduce_mpfr_with_u(L, params, max_bits, u)
 }
 
 fn max_entry_bits(L: &Lattice) -> u64 {
@@ -317,18 +373,37 @@ fn compute_gso_f64(L: &Lattice, mu: &mut [Vec<f64>], bstar_sq: &mut [f64]) {
 // ---------------------------------------------------------------------------
 
 fn reduce_mpfr(L: &mut Lattice, params: &LatticeReductionParams, max_bits: u64) -> usize {
+    reduce_mpfr_inner(L, params, max_bits, None)
+}
+
+/// MPFR LLL variant that also tracks a unimodular U such that
+/// `basis_out = basis_in · U`. Called from `reduce_with_u` for the
+/// recursive-heuristic path.
+fn reduce_mpfr_with_u(
+    L: &mut Lattice,
+    params: &LatticeReductionParams,
+    max_bits: u64,
+    u: &mut IntMatrix,
+) -> usize {
+    reduce_mpfr_inner(L, params, max_bits, Some(u))
+}
+
+fn reduce_mpfr_inner(
+    L: &mut Lattice,
+    params: &LatticeReductionParams,
+    max_bits: u64,
+    mut track_u: Option<&mut IntMatrix>,
+) -> usize {
     let n = L.rank;
     let delta = params.delta;
     if n == 0 {
         return 0;
     }
 
-    // Precision policy: μ = <b_k, b*_j> / ||b*_j||² is O(1) and we need
-    // absolute precision ≪ 0.5 in μ for `round(μ)` to be exact. The dot
-    // product has magnitude up to ~2^max_bits, so relative precision of
-    // `max_bits + log2(n) + 64` bits gives us `2^64` bits of slack in μ.
-    // Much tighter than `2·max_bits` which produced far more precision
-    // than the algorithm actually uses.
+    if let Some(ref mut u) = track_u {
+        u.set_identity();
+    }
+
     let prec: u32 = (max_bits as u32)
         .saturating_add((n as u32).next_power_of_two().trailing_zeros() + 64)
         .max(128);
@@ -347,9 +422,8 @@ fn reduce_mpfr(L: &mut Lattice, params: &LatticeReductionParams, max_bits: u64) 
     let mut k = 1usize;
     while k < n {
         iters += 1;
-        size_reduce_mpfr(L, k, &mut mu, prec);
+        size_reduce_mpfr(L, k, &mut mu, prec, track_u.as_deref_mut());
 
-        // Lovász: ||b*_k||² + μ² · ||b*_{k-1}||² ≥ δ · ||b*_{k-1}||²
         let mu_sq = Float::with_val(prec, &mu[k][k - 1] * &mu[k][k - 1]);
         let lhs = Float::with_val(prec, &bstar_sq[k] + &mu_sq * &bstar_sq[k - 1]);
         let rhs = Float::with_val(prec, &delta_f * &bstar_sq[k - 1]);
@@ -357,6 +431,9 @@ fn reduce_mpfr(L: &mut Lattice, params: &LatticeReductionParams, max_bits: u64) 
             k += 1;
         } else {
             swap_cols(L, k - 1, k);
+            if let Some(ref mut u) = track_u {
+                swap_cols_in(u, k - 1, k);
+            }
             swap_update_mpfr(&mut mu, &mut bstar_sq, k, n, prec);
             if k > 1 {
                 k -= 1;
@@ -441,7 +518,13 @@ fn compute_gso_mpfr(
     }
 }
 
-fn size_reduce_mpfr(L: &mut Lattice, k: usize, mu: &mut [Vec<Float>], prec: u32) {
+fn size_reduce_mpfr(
+    L: &mut Lattice,
+    k: usize,
+    mu: &mut [Vec<Float>],
+    prec: u32,
+    mut track_u: Option<&mut IntMatrix>,
+) {
     if k == 0 {
         return;
     }
@@ -452,12 +535,10 @@ fn size_reduce_mpfr(L: &mut Lattice, k: usize, mu: &mut [Vec<Float>], prec: u32)
     for jj in 0..k {
         let j = k - 1 - jj;
         let mu_kj = &mu[k][j];
-        // |mu_kj| > 0.5?
         let abs_mu = mu_kj.clone().abs();
         if abs_mu <= half {
             continue;
         }
-        // q = round(mu_kj) as an integer.
         let q_f = mu_kj.clone().round();
         let q_z = q_f.to_integer().unwrap_or_else(Integer::new);
         if q_z.is_zero() {
@@ -473,10 +554,21 @@ fn size_reduce_mpfr(L: &mut Lattice, k: usize, mu: &mut [Vec<Float>], prec: u32)
             tmp_i *= &q_z;
             *b_ik -= &tmp_i;
         }
-        // μ_{k, r} -= q · μ_{j, r} for r ≤ j.
+        // Track U: same column op on U.
+        if let Some(u_mat) = track_u.as_deref_mut() {
+            let u_nc = u_mat.ncols;
+            for i in 0..u_mat.nrows {
+                let row = &mut u_mat.data[i * u_nc..(i + 1) * u_nc];
+                let (left, right) = row.split_at_mut(k);
+                let u_ij = &left[j];
+                let u_ik = &mut right[0];
+                tmp_i.assign(u_ij);
+                tmp_i *= &q_z;
+                *u_ik -= &tmp_i;
+            }
+        }
         let q_float = Float::with_val(prec, &q_z);
         for r in 0..=j {
-            // mu[k][r] -= q_float * mu[j][r]
             let t = (&q_float * &mu[j][r]).complete(prec);
             mu[k][r] -= &t;
         }

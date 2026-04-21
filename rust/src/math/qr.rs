@@ -45,7 +45,7 @@ pub fn householder_qr(a: &mut MatMpfr, tau: &mut Vec<Float>) {
 ///
 /// Convention (LAPACK): alpha overwrites `A[i, i]`, v[1..] stays in
 /// `A[i+1..m, i]` scaled so that v[0] is implicitly 1.
-fn larfg(a: &mut MatMpfr, i: usize, m: usize, prec: u32) -> Float {
+pub(crate) fn larfg(a: &mut MatMpfr, i: usize, m: usize, prec: u32) -> Float {
     let n = a.ncols;
 
     // xnorm2 = sum_{k=i+1}^{m-1} A[k,i]²
@@ -102,7 +102,7 @@ fn larfg(a: &mut MatMpfr, i: usize, m: usize, prec: u32) -> Float {
 
 /// LARF: apply the Householder reflector H = I - τ·vvᵀ to column j of A,
 /// where v is stored implicitly in A[i..m, i] with v[0] = 1.
-fn larf(a: &mut MatMpfr, i: usize, j: usize, m: usize, tau: &Float, prec: u32) {
+pub(crate) fn larf(a: &mut MatMpfr, i: usize, j: usize, m: usize, tau: &Float, prec: u32) {
     if tau.is_zero() {
         return;
     }

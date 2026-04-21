@@ -91,7 +91,6 @@ pub fn size_reduce(b: &mut IntMatrix, r: &mut MatMpfr) {
 mod tests {
     use super::*;
     use crate::math::qr::{clear_subdiagonal, householder_qr};
-    use rug::Assign;
 
     /// Build R via QR, size-reduce (B, R), check off-diagonals of R are
     /// bounded and |det(B)| is preserved.

@@ -1,3 +1,4 @@
+pub mod fused_qr_sr;
 pub mod mat_mpfr;
 pub mod mat_mul;
 pub mod qr;
